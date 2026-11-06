@@ -15,6 +15,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY shared ./shared
 COPY backend ./backend
 
+# Remove o frontend do workspace do container para compilar exclusivamente o backend
+RUN sed -i '/"frontend"/d' Cargo.toml
+
 # Compilação otimizada em release
 RUN cargo build --release -p backend
 
