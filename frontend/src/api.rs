@@ -19,7 +19,7 @@ impl ApiClient {
         let url = base_url
             .or_else(|| std::env::var("API_BASE_URL").ok())
             .or_else(|| option_env!("API_BASE_URL").map(|s| s.to_string()))
-            .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
+            .unwrap_or_else(|| "https://app-compras-production.up.railway.app".to_string());
         Self {
             base_url: url,
             token,
