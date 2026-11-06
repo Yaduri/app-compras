@@ -129,6 +129,7 @@ html, body {
     color: var(--text-primary);
 }
 
+.user-avatar-circle,
 .user-avatar-sm {
     width: 22px;
     height: 22px;
@@ -138,8 +139,35 @@ html, body {
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 0.75rem;
-    font-weight: 600;
+    font-size: 0.72rem;
+    font-weight: 700;
+}
+
+.btn-logout,
+.btn-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    background: #ffffff;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    padding: 4px 12px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    font-family: inherit;
+    line-height: 1.4;
+    outline: none;
+}
+
+.btn-logout:hover,
+.btn-icon:hover {
+    background: #fef2f2;
+    border-color: #fecaca;
+    color: var(--danger);
 }
 
 /* Conteúdo Principal */

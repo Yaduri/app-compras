@@ -81,7 +81,7 @@ fn App() -> Element {
                                 span { "{user.name}" }
                             }
                             button {
-                                class: "btn-icon",
+                                class: "btn-logout",
                                 title: "Desconectar",
                                 onclick: handle_logout,
                                 "Sair"
