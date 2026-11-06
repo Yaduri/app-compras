@@ -7,6 +7,8 @@ pub struct Config {
     pub jwt_secret: String,
     pub supabase_url: Option<String>,
     pub supabase_anon_key: Option<String>,
+    pub google_client_id: Option<String>,
+    pub google_client_secret: Option<String>,
 }
 
 impl Config {
@@ -26,12 +28,17 @@ impl Config {
         let supabase_url = std::env::var("SUPABASE_URL").ok();
         let supabase_anon_key = std::env::var("SUPABASE_ANON_KEY").ok();
 
+        let google_client_id = std::env::var("GOOGLE_CLIENT_ID").ok();
+        let google_client_secret = std::env::var("GOOGLE_CLIENT_SECRET").ok();
+
         Self {
             port,
             database_url,
             jwt_secret,
             supabase_url,
             supabase_anon_key,
+            google_client_id,
+            google_client_secret,
         }
     }
 }

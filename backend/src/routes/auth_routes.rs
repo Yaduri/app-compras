@@ -137,29 +137,81 @@ pub async fn login(
     }))
 }
 
+#[derive(serde::Deserialize)]
+struct GoogleTokenClaims {
+    email: Option<String>,
+    name: Option<String>,
+    picture: Option<String>,
+}
+
 pub async fn google_auth(
     State(state): State<AppState>,
     Json(payload): Json<GoogleAuthRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    // Decodifica ou consulta informações do token do Google
-    // No Supabase OAuth, o id_token contém claims de email e nome
     if payload.id_token.trim().is_empty() {
         return Err(AppError::BadRequest("id_token inválido".to_string()));
     }
 
     let pool = state.get_pool()?;
 
-    // Tenta decodificar claims básicos ou utiliza fallback
-    let email = format!("google_user_{}@gmail.com", Uuid::new_v4().simple());
-    let name = "Usuário Google".to_string();
+    // 1. Tenta validar o token no endpoint oficial do Google
+    let client = reqwest::Client::new();
+    let mut resolved_email = None;
+    let mut resolved_name = None;
+    let mut resolved_avatar = None;
+
+    // Tenta validar como id_token oficial do Google
+    if let Ok(res) = client
+        .get(&format!(
+            "https://oauth2.googleapis.com/tokeninfo?id_token={}",
+            payload.id_token.trim()
+        ))
+        .send()
+        .await
+    {
+        if res.status().is_success() {
+            if let Ok(claims) = res.json::<GoogleTokenClaims>().await {
+                resolved_email = claims.email;
+                resolved_name = claims.name;
+                resolved_avatar = claims.picture;
+            }
+        }
+    }
+
+    // Se falhar, tenta como access_token via userinfo endpoint
+    if resolved_email.is_none() {
+        if let Ok(res) = client
+            .get("https://www.googleapis.com/oauth2/v3/userinfo")
+            .bearer_auth(payload.id_token.trim())
+            .send()
+            .await
+        {
+            if res.status().is_success() {
+                if let Ok(claims) = res.json::<GoogleTokenClaims>().await {
+                    resolved_email = claims.email;
+                    resolved_name = claims.name;
+                    resolved_avatar = claims.picture;
+                }
+            }
+        }
+    }
+
+    let email = resolved_email.ok_or_else(|| {
+        AppError::Unauthorized("Não foi possível autenticar o token do Google".to_string())
+    })?;
+    let name = resolved_name
+        .unwrap_or_else(|| email.split('@').next().unwrap_or("Usuário Google").to_string());
 
     let row = sqlx::query(
-        "INSERT INTO users (email, name) VALUES ($1, $2)
-         ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
+        "INSERT INTO users (email, name, avatar_url) VALUES ($1, $2, $3)
+         ON CONFLICT (email) DO UPDATE SET 
+            name = COALESCE(EXCLUDED.name, users.name),
+            avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url)
          RETURNING id, email, name, avatar_url",
     )
     .bind(&email)
     .bind(&name)
+    .bind(&resolved_avatar)
     .fetch_one(pool)
     .await?;
 

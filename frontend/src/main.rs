@@ -58,6 +58,33 @@ fn App() -> Element {
         api_client.set(ApiClient::new(None, None));
     };
 
+    // Auto-login se houver callback do Google / Supabase na URL
+    use_effect(move || {
+        let client = api_client.read().clone();
+        spawn(async move {
+            let mut eval = document::eval(
+                r#"
+                let hash = window.location.hash || window.location.search || "";
+                dioxus.send(hash);
+                "#,
+            );
+            if let Ok(val) = eval.recv::<String>().await {
+                if val.contains("access_token=") {
+                    let token_part = val.split("access_token=").nth(1).unwrap_or("");
+                    let access_token = token_part.split('&').next().unwrap_or("");
+                    if !access_token.is_empty() {
+                        if let Ok(res) = client.google_auth(access_token.to_string()).await {
+                            auth_token.set(Some(res.token.clone()));
+                            current_user.set(Some(res.user));
+                            api_client.set(ApiClient::new(Some(client.base_url), Some(res.token)));
+                            let _ = document::eval("window.history.replaceState({}, document.title, window.location.pathname);");
+                        }
+                    }
+                }
+            }
+        });
+    });
+
     rsx! {
         style { "{APP_CSS}" }
 

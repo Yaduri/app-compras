@@ -94,6 +94,19 @@ impl ApiClient {
         Self::handle_response(res).await
     }
 
+    pub async fn google_auth(&self, id_token: String) -> Result<AuthResponse, String> {
+        let req = shared::dto::GoogleAuthRequest { id_token };
+        let res = self
+            .client()
+            .post(format!("{}/api/auth/google", self.base_url))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| format!("Falha de conexão com o servidor: {}", e))?;
+
+        Self::handle_response(res).await
+    }
+
     pub async fn get_me(&self) -> Result<UserProfile, String> {
         let res = self
             .client()

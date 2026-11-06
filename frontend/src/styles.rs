@@ -462,6 +462,34 @@ html, body {
     transform: scale(0.98);
 }
 
+.btn-google {
+    width: 100%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: #ffffff;
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-btn);
+    padding: 10px 16px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+    font-family: inherit;
+}
+
+.btn-google:hover {
+    background: var(--surface-hover);
+    border-color: #cbd5e1;
+    transform: translateY(-1px);
+}
+
+.btn-google:active {
+    transform: scale(0.98);
+}
+
 .btn-secondary {
     background-color: #ffffff;
     color: var(--text-primary);
