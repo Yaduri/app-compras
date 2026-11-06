@@ -2,8 +2,8 @@
 # Dockerfile Multi-Stage de Produção para Railway.app
 # ==============================================================================
 
-# 1. Estágio de Compilação
-FROM rust:1.82-slim AS builder
+# 1. Estágio de Compilação (Utiliza a versão estável mais recente do Rust com suporte a Edition 2024)
+FROM rust:slim AS builder
 
 WORKDIR /app
 
