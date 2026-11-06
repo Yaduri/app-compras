@@ -10,7 +10,11 @@ echo [1/2] Variaveis configuradas:
 echo       ANDROID_HOME=%ANDROID_HOME%
 echo       NDK_HOME=%NDK_HOME%
 echo.
-echo [2/2] Iniciando compilacao via Dioxus CLI...
+echo [2/3] Sincronizando icones Android em alta resolucao...
+python scripts\setup_android_icons.py
+
+echo.
+echo [3/3] Iniciando compilacao via Dioxus CLI...
 
 cd frontend
 dx build --release --platform android

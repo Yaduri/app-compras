@@ -2,6 +2,18 @@
 name = "App Compras"
 default_platform = "desktop"
 out_dir = "dist"
+asset_dir = "assets"
+
+[bundle]
+identifier = "com.appcompras.lista"
+publisher = "App Compras"
+icon = [
+    "assets/icons/icon-48x48.png",
+    "assets/icons/icon-72x72.png",
+    "assets/icons/icon-96x96.png",
+    "assets/icons/icon-144x144.png",
+    "assets/icons/icon-192x192.png"
+]
 
 [application.android]
 package = "com.appcompras.lista"
