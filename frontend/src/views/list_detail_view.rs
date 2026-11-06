@@ -42,9 +42,6 @@ pub fn ListDetailView(
     let mut detail = use_signal(|| None::<ListDetailResponse>);
     let mut is_loading = use_signal(|| true);
 
-    // Modo Supermercado (Alto Contraste e Fontes Maiores)
-    let mut is_market_mode = use_signal(|| false);
-
     // Modal de Sugestões / Mais Comprados
     let mut show_suggestions_modal = use_signal(|| false);
     let mut suggestions = use_signal(Vec::<FrequentItemResponse>::new);
@@ -52,6 +49,9 @@ pub fn ListDetailView(
 
     // Notificação em tempo real (ex: "Maria marcou Leite no carrinho")
     let mut real_time_alert = use_signal(|| None::<String>);
+
+    // Gaveta / Bottom Sheet de Adição Rápida
+    let mut show_add_drawer = use_signal(|| false);
 
     // Formulário de adição rápida
     let mut new_item_name = use_signal(String::new);
@@ -306,6 +306,7 @@ pub fn ListDetailView(
                     new_item_name.set(String::new());
                     new_item_price.set(String::new());
                     new_item_qty.set("1".to_string());
+                    show_add_drawer.set(false);
                     if let Some(d) = detail.write().as_mut() {
                         if !d.items.iter().any(|i| i.id == new_item.id) {
                             d.items.push(new_item);
@@ -337,6 +338,7 @@ pub fn ListDetailView(
                     new_item_name.set(String::new());
                     new_item_price.set(String::new());
                     new_item_qty.set("1".to_string());
+                    show_add_drawer.set(false);
                     if let Some(d) = detail.write().as_mut() {
                         d.items.push(fallback_item);
                         recalculate_totals(d);
@@ -491,44 +493,37 @@ pub fn ListDetailView(
         });
     };
 
-    let market_mode_class = if *is_market_mode.read() { "market-mode" } else { "" };
-
     rsx! {
-        div { class: "main-content {market_mode_class}", style: "min-height: 100vh; display: flex; flex-direction: column;",
-            // Barra Superior de Controle
-            div { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; gap: 8px; flex-wrap: wrap;",
+        div { class: "main-content",
+            // Barra Superior de Navegação
+            div { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; gap: 8px;",
                 button {
                     class: "btn btn-secondary",
-                    style: "padding: 8px 14px; min-height: 40px;",
+                    style: "padding: 6px 14px; font-size: 0.85rem;",
                     onclick: move |_| active_list_id.set(None),
-                    "← Voltar"
+                    "← Listas"
                 }
 
                 div { style: "display: flex; align-items: center; gap: 8px;",
-                    // Botão Alternador do Modo Supermercado
                     button {
-                        class: if *is_market_mode.read() { "btn btn-success" } else { "btn btn-secondary" },
-                        style: "padding: 8px 14px; min-height: 40px; font-weight: 700;",
-                        onclick: move |_| is_market_mode.toggle(),
-                        if *is_market_mode.read() { "🛒 Modo Mercado Ativo" } else { "🛒 Modo Mercado" }
+                        class: "btn btn-secondary",
+                        style: "padding: 6px 12px; font-size: 0.82rem;",
+                        onclick: open_suggestions,
+                        "Sugeridos"
                     }
-
                     if let Some(d) = detail.read().as_ref() {
                         span {
                             class: "badge badge-code",
-                            style: "font-size: 0.95rem; padding: 6px 12px;",
-                            title: "Código para convidar participantes",
-                            "🔑 {d.list.invite_code}"
+                            title: "Código da Lista",
+                            "{d.list.invite_code}"
                         }
                     }
                 }
             }
 
-            // Alerta de Notificação em Tempo Real (WebSocket)
+            // Notificações em Tempo Real (WebSocket)
             if let Some(msg) = real_time_alert.read().as_ref() {
-                div {
-                    class: "alert",
-                    style: "background-color: #f0fdf4; color: #166534; border: 1px solid #86efac; display: flex; justify-content: space-between; align-items: center; animation: pulse 1s;",
+                div { class: "alert alert-success",
                     span { "{msg}" }
                     span {
                         style: "cursor: pointer; font-weight: bold; margin-left: 12px;",
@@ -554,262 +549,237 @@ pub fn ListDetailView(
                     };
 
                     rsx! {
-                        // Card do Cabeçalho e Totais Parciais em Tempo Real
-                        div { class: "card", style: "border-top: 4px solid #10b981;",
-                            div { style: "display: flex; justify-content: space-between; align-items: flex-start;",
-                                div {
-                                    h2 { style: "font-size: 1.5rem; font-weight: 700; color: #0f172a; margin-bottom: 4px;", "{d.list.name}" }
-                                    if let Some(desc) = &d.list.description {
-                                        p { style: "color: #64748b; font-size: 0.9rem; margin-bottom: 10px;", "{desc}" }
+                        // Cabeçalho Editorial Minimalista (Things 3)
+                        div { style: "margin-top: 8px; margin-bottom: 20px;",
+                            h1 { style: "font-size: 1.7rem; font-weight: 800; letter-spacing: -0.025em; color: var(--text-primary); margin-bottom: 4px;", "{d.list.name}" }
+                            if let Some(desc) = &d.list.description {
+                                p { style: "color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;", "{desc}" }
+                            }
+
+                            // Barra de Progresso Discreta (4px)
+                            div { style: "display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px; margin-top: 10px;",
+                                span { "{d.totals.purchased_items} de {d.totals.total_items} no carrinho" }
+                                span { style: "font-weight: 600; color: var(--text-primary);", "{progress_pct:.0}%" }
+                            }
+                            div { style: "width: 100%; height: 4px; background: #e2e8f0; border-radius: 2px; overflow: hidden;",
+                                div { style: "width: {progress_pct:.0}%; height: 100%; background: var(--carbon-dark); border-radius: 2px; transition: width 0.25s ease;" }
+                            }
+                        }
+
+                        // Seção de Itens da Lista (Agrupados por Categoria em Inset-Groups)
+                        if pending_items.is_empty() && purchased_items.is_empty() {
+                            div { style: "text-align: center; padding: 60px 20px; color: var(--text-muted);",
+                                p { style: "font-size: 1.05rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px;", "Sua lista está vazia" }
+                                p { style: "font-size: 0.85rem;", "Toque no botão '+' abaixo para adicionar produtos." }
+                            }
+                        } else {
+                            // Categorias com produtos pendentes
+                            for cat in CategoryId::all().iter().filter(|c| pending_items.iter().any(|i| i.category_id == **c)) {
+                                div { key: "{cat.as_str()}", class: "inset-group",
+                                    // Cabeçalho da Seção de Mercado
+                                    div { class: "aisle-header",
+                                        span { class: "aisle-dot", style: "background-color: {cat.color_hex()};" }
+                                        span { "{cat.display_name()}" }
                                     }
-                                }
-                                div { style: "display: flex; gap: 4px;",
-                                    button {
-                                        class: "btn btn-secondary",
-                                        style: "padding: 6px 12px; font-size: 0.85rem; min-height: 36px;",
-                                        onclick: open_suggestions,
-                                        "✨ Mais Comprados"
+
+                                    // Linhas de itens
+                                    for item in pending_items.iter().filter(|i| i.category_id == *cat) {
+                                        div { key: "{item.id}", class: "minimal-item-row",
+                                            input {
+                                                class: "minimal-checkbox",
+                                                r#type: "checkbox",
+                                                checked: false,
+                                                onchange: {
+                                                    let item_id = item.id;
+                                                    let price = item.actual_price.or(item.estimated_price);
+                                                    move |_| handle_toggle_item(item_id, false, price)
+                                                }
+                                            }
+
+                                            div { class: "item-info",
+                                                div { class: "item-name", "{item.name}" }
+                                                div { class: "item-meta",
+                                                    span { class: "item-qty-tag", "{item.quantity} {item.unit.as_str()}" }
+                                                    if let Some(adder) = &item.added_by_user_name {
+                                                        span { "por {adder}" }
+                                                    }
+                                                }
+                                            }
+
+                                            if let Some(p) = item.actual_price.or(item.estimated_price) {
+                                                div { class: "item-price", "R$ {p:.2}" }
+                                            }
+
+                                            button {
+                                                class: "item-delete-btn",
+                                                title: "Remover",
+                                                onclick: {
+                                                    let item_id = item.id;
+                                                    move |_| handle_delete_item(item_id)
+                                                },
+                                                "✕"
+                                            }
+                                        }
                                     }
                                 }
                             }
 
-                            // Barra de Progresso
-                            div { class: "progress-container", style: "height: 8px; margin: 12px 0 10px 0;",
-                                div { class: "progress-bar", style: "width: {progress_pct:.0}%;" }
-                            }
+                            // Itens Concluídos (No Carrinho)
+                            if !purchased_items.is_empty() {
+                                div { style: "margin-top: 20px;",
+                                    div { style: "font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; padding-left: 4px;",
+                                        "CONCLUÍDOS ({purchased_items.len()})"
+                                    }
 
-                            // Totais Orçamentários (Total Planejado vs Total no Carrinho)
-                            div { style: "display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 0.95rem; flex-wrap: wrap; gap: 8px;",
-                                div {
-                                    span { style: "color: #64748b;", "Total Planejado: " }
-                                    strong { "R$ {d.totals.total_planned:.2}" }
-                                }
-                                div {
-                                    span { style: "color: #059669; font-weight: 600;", "No Carrinho: " }
-                                    strong { style: "color: #059669; font-size: 1.15rem; font-weight: 800;", "R$ {d.totals.total_cart:.2}" }
-                                }
-                                div {
-                                    span { style: "color: #059669; font-weight: 600; background-color: #d1fae5; padding: 4px 8px; border-radius: 6px;", "{d.totals.purchased_items}/{d.totals.total_items} itens ({progress_pct:.0}%)" }
+                                    div { class: "inset-group",
+                                        for item in purchased_items.iter() {
+                                            div { key: "{item.id}", class: "minimal-item-row is-purchased",
+                                                input {
+                                                    class: "minimal-checkbox",
+                                                    r#type: "checkbox",
+                                                    checked: true,
+                                                    onchange: {
+                                                        let item_id = item.id;
+                                                        let price = item.actual_price.or(item.estimated_price);
+                                                        move |_| handle_toggle_item(item_id, true, price)
+                                                    }
+                                                }
+
+                                                div { class: "item-info",
+                                                    div { class: "item-name", "{item.name}" }
+                                                    div { class: "item-meta",
+                                                        span { class: "item-qty-tag", "{item.quantity} {item.unit.as_str()}" }
+                                                        if let Some(buyer) = &item.purchased_by_user_name {
+                                                            span { "marcado por {buyer}" }
+                                                        }
+                                                    }
+                                                }
+
+                                                if let Some(p) = item.actual_price.or(item.estimated_price) {
+                                                    div { class: "item-price", "R$ {p:.2}" }
+                                                }
+
+                                                button {
+                                                    class: "item-delete-btn",
+                                                    title: "Remover",
+                                                    onclick: {
+                                                        let item_id = item.id;
+                                                        move |_| handle_delete_item(item_id)
+                                                    },
+                                                    "✕"
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
 
-                        // Formulário de Adição Rápida de Produto com Autocategorização
-                        if !*is_market_mode.read() {
-                            div { class: "card", style: "background-color: #ffffff; border: 1px solid #e2e8f0;",
-                                h3 { style: "font-size: 1rem; font-weight: 700; margin-bottom: 12px; color: #1e293b;", "⚡ Adição Rápida com Autocategorização" }
+                        // Barra Flutuante de Resumo e Ação (A exata pílula da sua imagem anexada!)
+                        div { class: "floating-summary-pill",
+                            div { class: "floating-summary-text",
+                                span { "{d.totals.total_items} itens" }
+                                span { "•" }
+                                span { "Total: " }
+                                strong { "R$ {d.totals.total_planned:.2}" }
+                            }
+                            button {
+                                class: "floating-add-btn",
+                                title: "Adicionar produto",
+                                onclick: move |_| show_add_drawer.set(true),
+                                "+"
+                            }
+                        }
 
-                                div { style: "display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap;",
-                                    div { style: "flex: 3; min-width: 200px;",
+                        // Bottom Sheet / Gaveta para Adicionar Item
+                        if *show_add_drawer.read() {
+                            div {
+                                class: "drawer-overlay",
+                                onclick: move |_| show_add_drawer.set(false),
+                                div {
+                                    class: "drawer-content",
+                                    onclick: move |e| e.stop_propagation(),
+
+                                    div { class: "drawer-handle" }
+
+                                    div { style: "display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;",
+                                        h3 { style: "font-size: 1.15rem; font-weight: 700; color: var(--text-primary);", "Adicionar à Lista" }
+                                        button {
+                                            class: "btn-ghost",
+                                            onclick: move |_| show_add_drawer.set(false),
+                                            "✕"
+                                        }
+                                    }
+
+                                    div { class: "form-group",
                                         input {
                                             class: "form-input",
-                                            placeholder: "Ex: Leite, Maçã gala, Picanha, Detergente...",
+                                            placeholder: "Nome do produto (ex: Leite, Maçã gala, Picanha...)",
                                             value: "{new_item_name}",
                                             oninput: move |e| new_item_name.set(e.value())
                                         }
                                     }
-                                    div { style: "flex: 1; min-width: 70px;",
-                                        input {
-                                            class: "form-input",
-                                            r#type: "number",
-                                            placeholder: "Qtd",
-                                            value: "{new_item_qty}",
-                                            oninput: move |e| new_item_qty.set(e.value())
-                                        }
-                                    }
-                                    div { style: "flex: 1; min-width: 80px;",
-                                        select {
-                                            class: "form-input",
-                                            onchange: move |e| {
-                                                new_item_unit.set(QuantityUnit::from_unit_str(&e.value()));
-                                            },
-                                            option { value: "un", "un" }
-                                            option { value: "kg", "kg" }
-                                            option { value: "g", "g" }
-                                            option { value: "l", "l" }
-                                            option { value: "pct", "pct" }
-                                            option { value: "cx", "cx" }
-                                            option { value: "dz", "dz" }
-                                        }
-                                    }
-                                    div { style: "flex: 1; min-width: 90px;",
-                                        input {
-                                            class: "form-input",
-                                            placeholder: "R$ Estimado",
-                                            value: "{new_item_price}",
-                                            oninput: move |e| new_item_price.set(e.value())
-                                        }
-                                    }
-                                }
 
-                                // Preview em tempo real da categoria identificada
-                                if !new_item_name.read().trim().is_empty() {
-                                    div { style: "display: flex; align-items: center; gap: 6px; margin-bottom: 12px; font-size: 0.85rem;",
-                                        span { style: "color: #64748b;", "Categoria Identificada:" }
-                                        span {
-                                            class: "badge",
-                                            style: "background-color: {preview_category.color_hex()}; color: #ffffff;",
-                                            "{preview_category.display_name()}"
-                                        }
-                                    }
-                                }
-
-                                button {
-                                    class: "btn btn-primary",
-                                    style: "width: 100%; font-size: 1rem;",
-                                    onclick: handle_add_item,
-                                    "➕ Adicionar à Lista"
-                                }
-                            }
-                        }
-
-                        // Seção de Itens Pendentes (Agrupados por Seção do Mercado)
-                        if pending_items.is_empty() && purchased_items.is_empty() {
-                            div { style: "text-align: center; padding: 40px; color: #64748b;",
-                                "Sua lista está vazia. Adicione produtos acima para iniciar as compras!"
-                            }
-                        } else {
-                            // Itera sobre as categorias com produtos pendentes
-                            for cat in CategoryId::all().iter().filter(|c| pending_items.iter().any(|i| i.category_id == **c)) {
-                                div { key: "{cat.as_str()}", style: "margin-bottom: 22px;",
-                                    // Cabeçalho da Seção de Mercado
-                                    div { style: "display: flex; align-items: center; gap: 8px; margin-bottom: 10px;",
-                                        span {
-                                            style: "width: 14px; height: 14px; border-radius: 50%; background-color: {cat.color_hex()}; display: inline-block;"
-                                        }
-                                        h4 { style: "font-size: 1.15rem; font-weight: 700;",
-                                            "{cat.display_name()}"
+                                    // Preview em tempo real da categoria
+                                    if !new_item_name.read().trim().is_empty() {
+                                        div { style: "display: flex; align-items: center; gap: 6px; margin-bottom: 14px; font-size: 0.82rem;",
+                                            span { style: "color: var(--text-secondary);", "Corredor sugerido:" }
+                                            span {
+                                                class: "badge",
+                                                style: "background-color: {preview_category.color_hex()}; color: #ffffff;",
+                                                "{preview_category.display_name()}"
+                                            }
                                         }
                                     }
 
-                                    // Lista de Itens da Categoria
-                                    for item in pending_items.iter().filter(|i| i.category_id == *cat) {
-                                        div {
-                                            key: "{item.id}",
-                                            class: "item-card",
-
-                                            // Checkbox Grande de Supermercado
+                                    div { style: "display: flex; gap: 8px; margin-bottom: 20px;",
+                                        div { style: "flex: 1;",
                                             input {
-                                                class: "market-checkbox",
-                                                r#type: "checkbox",
-                                                checked: item.purchased,
-                                                onchange: {
-                                                    let item_id = item.id;
-                                                    let is_purchased = item.purchased;
-                                                    let price = item.actual_price.or(item.estimated_price);
-                                                    move |_| handle_toggle_item(item_id, is_purchased, price)
-                                                }
-                                            }
-
-                                            div { class: "item-details",
-                                                div { style: "display: flex; justify-content: space-between; align-items: baseline;",
-                                                    span { class: "item-name", "{item.name}" }
-                                                    if let Some(p) = item.actual_price.or(item.estimated_price) {
-                                                        span { style: "font-weight: 700; font-size: 1.05rem; margin-left: 8px;",
-                                                            "R$ {p:.2}"
-                                                        }
-                                                    }
-                                                }
-                                                div { class: "item-meta",
-                                                    span { class: "badge", style: "background-color: #e2e8f0; color: #334155;",
-                                                        "{item.quantity} {item.unit.as_str()}"
-                                                    }
-                                                    if let Some(adder) = &item.added_by_user_name {
-                                                        span { style: "color: #94a3b8;", "• Adicionado por {adder}" }
-                                                    }
-                                                }
-                                            }
-
-                                            // Botão de Excluir Item
-                                            button {
-                                                class: "btn-icon",
-                                                style: "color: #94a3b8; font-size: 1.1rem; padding: 6px 10px;",
-                                                title: "Excluir item",
-                                                onclick: {
-                                                    let item_id = item.id;
-                                                    move |_| handle_delete_item(item_id)
-                                                },
-                                                "🗑️"
+                                                class: "form-input",
+                                                r#type: "number",
+                                                placeholder: "Qtd",
+                                                value: "{new_item_qty}",
+                                                oninput: move |e| new_item_qty.set(e.value())
                                             }
                                         }
-                                    }
-                                }
-                            }
-
-                            // Seção: Itens no Carrinho (Comprados) - Vão automaticamente para o final
-                            if !purchased_items.is_empty() {
-                                div { style: "margin-top: 30px; border-top: 2px dashed #cbd5e1; padding-top: 20px;",
-                                    h4 { style: "font-size: 1.15rem; color: #059669; font-weight: 700; margin-bottom: 12px; display: flex; align-items: center; gap: 6px;",
-                                        "✅ No Carrinho ({purchased_items.len()})"
-                                    }
-
-                                    for item in purchased_items.iter() {
-                                        div {
-                                            key: "{item.id}",
-                                            class: "item-card purchased",
-
+                                        div { style: "flex: 1.2;",
+                                            select {
+                                                class: "form-input",
+                                                onchange: move |e| {
+                                                    new_item_unit.set(QuantityUnit::from_unit_str(&e.value()));
+                                                },
+                                                option { value: "un", "un" }
+                                                option { value: "kg", "kg" }
+                                                option { value: "g", "g" }
+                                                option { value: "l", "l" }
+                                                option { value: "pct", "pct" }
+                                                option { value: "cx", "cx" }
+                                                option { value: "dz", "dz" }
+                                            }
+                                        }
+                                        div { style: "flex: 1.5;",
                                             input {
-                                                class: "market-checkbox",
-                                                r#type: "checkbox",
-                                                checked: true,
-                                                onchange: {
-                                                    let item_id = item.id;
-                                                    let price = item.actual_price.or(item.estimated_price);
-                                                    move |_| handle_toggle_item(item_id, true, price)
-                                                }
-                                            }
-
-                                            div { class: "item-details",
-                                                div { style: "display: flex; justify-content: space-between; align-items: baseline;",
-                                                    span { class: "item-name", "{item.name}" }
-                                                    if let Some(p) = item.actual_price.or(item.estimated_price) {
-                                                        span { style: "font-weight: 700; color: #059669; font-size: 1.05rem; margin-left: 8px;",
-                                                            "R$ {p:.2}"
-                                                        }
-                                                    }
-                                                }
-                                                div { class: "item-meta",
-                                                    span { class: "badge", style: "background-color: #d1fae5; color: #065f46; font-weight: 600;",
-                                                        "{item.quantity} {item.unit.as_str()}"
-                                                    }
-                                                    if let Some(buyer) = &item.purchased_by_user_name {
-                                                        span { style: "color: #059669; font-weight: 500;", "• Marcado por {buyer}" }
-                                                    }
-                                                }
-                                            }
-
-                                            button {
-                                                class: "btn-icon",
-                                                style: "color: #94a3b8; font-size: 1.1rem; padding: 6px 10px;",
-                                                onclick: {
-                                                    let item_id = item.id;
-                                                    move |_| handle_delete_item(item_id)
-                                                },
-                                                "🗑️"
+                                                class: "form-input",
+                                                placeholder: "R$ Estimado",
+                                                value: "{new_item_price}",
+                                                oninput: move |e| new_item_price.set(e.value())
                                             }
                                         }
                                     }
-                                }
-                            }
-                        }
 
-                        // Barra Fixa de Rodapé no Modo Supermercado
-                        if *is_market_mode.read() {
-                            div { class: "sticky-cart-summary",
-                                div {
-                                    div { style: "font-size: 0.85rem; opacity: 0.9;", "Subtotal no Carrinho:" }
-                                    div { style: "font-size: 1.4rem; font-weight: 800;", "R$ {d.totals.total_cart:.2}" }
-                                }
-                                div { style: "text-align: right;",
-                                    div { style: "font-size: 0.85rem; opacity: 0.9;", "Restam comprar:" }
-                                    div { style: "font-size: 1.2rem; font-weight: 700;", "{pending_items.len()} itens" }
+                                    button {
+                                        class: "btn btn-primary",
+                                        style: "width: 100%; padding: 12px; font-size: 0.95rem;",
+                                        onclick: handle_add_item,
+                                        "Adicionar Produto"
+                                    }
                                 }
                             }
                         }
                     }
                 }
             } else if *is_loading.read() {
-                div { style: "text-align: center; padding: 60px; color: #64748b;", "Carregando itens da lista de compras..." }
+                div { style: "text-align: center; padding: 60px; color: var(--text-muted);", "Carregando itens..." }
             }
 
             // Modal: Mais Comprados / Sugestões Inteligentes

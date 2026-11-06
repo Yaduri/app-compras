@@ -102,29 +102,28 @@ pub fn AuthView(
     };
 
     rsx! {
-        div { class: "main-content", style: "display: flex; flex-direction: column; justify-content: center; max-width: 440px; margin: 30px auto; min-height: 85vh;",
-            // Hero / Branding
-            div { style: "text-align: center; margin-bottom: 28px;",
-                div { style: "width: 72px; height: 72px; margin: 0 auto 16px auto; background: linear-gradient(135deg, #d1fae5 0%, #ecfdf5 100%); border-radius: 22px; display: flex; align-items: center; justify-content: center; font-size: 2.2rem; box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.28); border: 1.5px solid #a7f3d0;",
-                    "🛒"
+        div { class: "main-content", style: "display: flex; flex-direction: column; justify-content: center; max-width: 400px; margin: 40px auto; min-height: 80vh;",
+            // Hero / Branding Minimalista (Linear / Things 3)
+            div { style: "text-align: center; margin-bottom: 32px;",
+                div { style: "width: 56px; height: 56px; margin: 0 auto 16px auto; background: var(--carbon-dark); border-radius: 16px; display: flex; align-items: center; justify-content: center; color: #ffffff; font-size: 1.4rem; font-weight: 800; box-shadow: 0 4px 14px rgba(15, 23, 42, 0.15);",
+                    "✓"
                 }
-                h2 { style: "font-size: 1.85rem; color: #0f172a; font-weight: 800; letter-spacing: -0.03em;",
+                h2 { style: "font-size: 1.6rem; color: var(--text-primary); font-weight: 800; letter-spacing: -0.03em;",
                     "App Compras"
                 }
-                p { style: "color: #64748b; font-size: 0.95rem; margin-top: 6px; max-width: 330px; margin-left: auto; margin-right: auto; line-height: 1.4;",
-                    "Lista de supermercado colaborativa em tempo real para sua casa e família"
+                p { style: "color: var(--text-secondary); font-size: 0.88rem; margin-top: 4px; line-height: 1.4;",
+                    "Listas compartilhadas em tempo real"
                 }
             }
 
             if let Some(err) = error_msg.read().as_ref() {
                 div { class: "alert alert-error",
-                    span { style: "font-size: 1.1rem;", "⚠️" }
                     span { "{err}" }
                 }
             }
 
             div { class: "card",
-                // Seletor iOS-style de Abas
+                // Seletor Minimalista de Abas
                 div { class: "segmented-control",
                     button {
                         class: if !*is_register.read() { "segmented-btn active" } else { "segmented-btn" },
@@ -180,7 +179,7 @@ pub fn AuthView(
 
                 button {
                     class: "btn btn-primary",
-                    style: "width: 100%; margin-top: 6px;",
+                    style: "width: 100%; margin-top: 8px;",
                     disabled: *is_loading.read(),
                     onclick: handle_submit,
                     if *is_loading.read() {
@@ -188,21 +187,20 @@ pub fn AuthView(
                     } else if *is_register.read() {
                         "Concluir Cadastro"
                     } else {
-                        "Entrar no App"
+                        "Entrar"
                     }
                 }
 
-                div { style: "text-align: center; margin: 20px 0 14px 0; color: #94a3b8; font-size: 0.78rem; font-weight: 700; letter-spacing: 0.06em;",
-                    "— OU EXPERIMENTE SEM CADASTRO —"
+                div { style: "text-align: center; margin: 20px 0 14px 0; color: var(--text-muted); font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em;",
+                    "— OU CONTINUE COM —"
                 }
 
                 button {
-                    class: "btn",
-                    style: "width: 100%; background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%); border: 1.5px solid #a7f3d0; color: #065f46; font-weight: 700;",
+                    class: "btn btn-secondary",
+                    style: "width: 100%; font-weight: 600; font-size: 0.88rem;",
                     disabled: *is_loading.read(),
                     onclick: handle_demo_login,
-                    span { style: "font-size: 1.1rem;", "⚡" }
-                    span { "Acesso Rápido Demo (1 Clique)" }
+                    "Acesso Rápido Demo (1 Clique)"
                 }
             }
         }

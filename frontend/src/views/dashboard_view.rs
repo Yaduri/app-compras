@@ -172,21 +172,21 @@ pub fn DashboardView(
     rsx! {
         div { class: "main-content",
             // Header do Dashboard
-            div { style: "display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px;",
+            div { style: "display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border-light);",
                 div {
-                    h2 { style: "font-size: 1.4rem; font-weight: 700;", "Olá, {user_name}! 👋" }
-                    p { style: "color: #64748b; font-size: 0.9rem;", "Suas listas de compras compartilhadas" }
+                    h2 { style: "font-size: 1.5rem; font-weight: 800; letter-spacing: -0.025em; color: var(--text-primary);", "{user_name}" }
+                    p { style: "color: var(--text-secondary); font-size: 0.85rem; margin-top: 2px;", "Listas de compras compartilhadas" }
                 }
                 div { style: "display: flex; gap: 8px;",
                     button {
                         class: "btn btn-primary",
                         onclick: move |_| show_create_modal.set(true),
-                        "➕ Nova Lista"
+                        "+ Nova Lista"
                     }
                     button {
                         class: "btn btn-secondary",
                         onclick: move |_| show_join_modal.set(true),
-                        "🔗 Inserir Código"
+                        "Inserir Código"
                     }
                 }
             }
@@ -194,7 +194,7 @@ pub fn DashboardView(
             // Notificações
             if let Some(err) = error_msg.read().as_ref() {
                 div { class: "alert alert-error",
-                    div { style: "display: flex; justify-content: space-between;",
+                    div { style: "display: flex; justify-content: space-between; width: 100%;",
                         span { "{err}" }
                         span { style: "cursor: pointer; font-weight: bold;", onclick: move |_| error_msg.set(None), "✕" }
                     }
@@ -203,7 +203,7 @@ pub fn DashboardView(
 
             if let Some(succ) = success_msg.read().as_ref() {
                 div { class: "alert alert-success",
-                    div { style: "display: flex; justify-content: space-between;",
+                    div { style: "display: flex; justify-content: space-between; width: 100%;",
                         span { "{succ}" }
                         span { style: "cursor: pointer; font-weight: bold;", onclick: move |_| success_msg.set(None), "✕" }
                     }
@@ -212,80 +212,81 @@ pub fn DashboardView(
 
             // Listagem de Listas
             if *is_loading.read() && lists.read().is_empty() {
-                div { style: "text-align: center; padding: 40px; color: #64748b;", "Carregando suas listas..." }
+                div { style: "text-align: center; padding: 48px; color: var(--text-muted); font-size: 0.9rem;", "Carregando suas listas..." }
             } else if lists.read().is_empty() {
-                div { class: "card", style: "text-align: center; padding: 40px 20px;",
-                    div { style: "font-size: 2.5rem; margin-bottom: 12px;", "📝" }
-                    h3 { style: "color: #334155; margin-bottom: 8px;", "Você ainda não tem listas de compras" }
-                    p { style: "color: #64748b; margin-bottom: 20px; font-size: 0.95rem;",
+                div { class: "inset-group", style: "text-align: center; padding: 48px 20px;",
+                    h3 { style: "color: var(--text-primary); font-size: 1.1rem; font-weight: 700; margin-bottom: 6px;", "Nenhuma lista encontrada" }
+                    p { style: "color: var(--text-secondary); margin-bottom: 20px; font-size: 0.88rem;",
                         "Crie sua primeira lista ou use um código de convite para participar da lista de alguém."
                     }
                     div { style: "display: flex; justify-content: center; gap: 12px;",
                         button {
                             class: "btn btn-primary",
                             onclick: move |_| show_create_modal.set(true),
-                            "Criar Minha Primeira Lista"
+                            "+ Criar Minha Primeira Lista"
                         }
                     }
                 }
             } else {
-                for list in lists.read().iter() {
-                    {
-                        let list_id = list.id;
-                        let progress_pct = if list.totals.total_items > 0 {
-                            (list.totals.purchased_items as f64 / list.totals.total_items as f64) * 100.0
-                        } else {
-                            0.0
-                        };
+                div { style: "display: flex; flex-direction: column; gap: 12px;",
+                    for list in lists.read().iter() {
+                        {
+                            let list_id = list.id;
+                            let progress_pct = if list.totals.total_items > 0 {
+                                (list.totals.purchased_items as f64 / list.totals.total_items as f64) * 100.0
+                            } else {
+                                0.0
+                            };
 
-                        rsx! {
-                            div {
-                                key: "{list.id}",
-                                class: "card",
-                                style: "cursor: pointer; border-left: 5px solid #10b981; transition: transform 0.15s ease, box-shadow 0.15s ease;",
-                                onclick: move |_| active_list_id.set(Some(list_id)),
+                            rsx! {
+                                div {
+                                    key: "{list.id}",
+                                    class: "card",
+                                    style: "cursor: pointer; padding: 18px 20px; margin-bottom: 0; transition: border-color 0.15s ease, transform 0.1s ease;",
+                                    onclick: move |_| active_list_id.set(Some(list_id)),
 
-                                div { style: "display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;",
-                                    div {
-                                        h3 { style: "font-size: 1.25rem; font-weight: 700; color: #0f172a; margin-bottom: 4px;", "{list.name}" }
-                                        if let Some(desc) = &list.description {
-                                            p { style: "font-size: 0.88rem; color: #64748b; margin-bottom: 8px; line-height: 1.4;", "{desc}" }
+                                    div { style: "display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;",
+                                        div { style: "flex: 1;",
+                                            h3 { style: "font-size: 1.18rem; font-weight: 700; color: var(--text-primary); margin-bottom: 3px; letter-spacing: -0.015em;", "{list.name}" }
+                                            if let Some(desc) = &list.description {
+                                                p { style: "font-size: 0.84rem; color: var(--text-secondary); margin-bottom: 6px; line-height: 1.3;", "{desc}" }
+                                            }
+                                        }
+                                        div { style: "display: flex; gap: 6px; align-items: center;",
+                                            span { class: "badge badge-code", title: "Código de Convite",
+                                                "{list.invite_code}"
+                                            }
+                                            if list.role == MemberRole::Owner {
+                                                span { class: "badge", style: "background: #f1f5f9; color: #0f172a; font-weight: 600;", "Dono" }
+                                            } else {
+                                                span { class: "badge", style: "background: #f1f5f9; color: #64748b; font-weight: 500;", "Membro" }
+                                            }
                                         }
                                     }
-                                    div { style: "display: flex; gap: 6px; align-items: center;",
-                                        span { class: "badge badge-code", title: "Código de Convite Compartilhável",
-                                            "🔑 {list.invite_code}"
+
+                                    // Barra de Progresso Discreta (4px)
+                                    div { style: "width: 100%; height: 4px; background: #f1f5f9; border-radius: 2px; overflow: hidden; margin-top: 10px; margin-bottom: 8px;",
+                                        div { style: "width: {progress_pct:.0}%; height: 100%; background: var(--carbon-dark); border-radius: 2px; transition: width 0.2s ease;" }
+                                    }
+
+                                    div { style: "display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; color: var(--text-secondary); margin-top: 6px;",
+                                        span {
+                                            "{list.totals.purchased_items} de {list.totals.total_items} no carrinho ({progress_pct:.0}%)"
                                         }
-                                        if list.role == MemberRole::Owner {
-                                            span { class: "badge", style: "background-color: #fef3c7; color: #b45309; font-weight: 600;", "👑 Dono" }
-                                        } else {
-                                            span { class: "badge", style: "background-color: #f1f5f9; color: #475569; font-weight: 600;", "Membro" }
+                                        span {
+                                            "{list.member_count} participante(s)"
                                         }
                                     }
-                                }
 
-                                // Barra de Progresso do Carrinho
-                                div { class: "progress-container",
-                                    div { class: "progress-bar", style: "width: {progress_pct:.0}%;" }
-                                }
-
-                                div { style: "display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; color: #64748b; margin-top: 8px;",
-                                    span { style: "font-weight: 600; color: #059669;",
-                                        "🛒 {list.totals.purchased_items}/{list.totals.total_items} no carrinho ({progress_pct:.0}%)"
-                                    }
-                                    span {
-                                        "👥 {list.member_count} participante(s)"
-                                    }
-                                }
-
-                                div { style: "display: flex; justify-content: space-between; align-items: center; border-top: 1px solid #f1f5f9; padding-top: 10px; margin-top: 10px; font-size: 0.9rem;",
-                                    div {
-                                        span { style: "color: #64748b;", "Planejado: " }
-                                        strong { "R$ {list.totals.total_planned:.2}" }
-                                    }
-                                    div {
-                                        span { style: "color: #059669; font-weight: 600;", "No Carrinho: " }
-                                        strong { style: "color: #059669; font-size: 1.05rem;", "R$ {list.totals.total_cart:.2}" }
+                                    div { style: "display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-light); padding-top: 10px; margin-top: 12px; font-size: 0.88rem;",
+                                        div {
+                                            span { style: "color: var(--text-muted); font-size: 0.8rem;", "Planejado: " }
+                                            strong { style: "color: var(--text-secondary);", "R$ {list.totals.total_planned:.2}" }
+                                        }
+                                        div {
+                                            span { style: "color: var(--text-muted); font-size: 0.8rem;", "No Carrinho: " }
+                                            strong { style: "color: var(--text-primary); font-size: 1rem;", "R$ {list.totals.total_cart:.2}" }
+                                        }
                                     }
                                 }
                             }
