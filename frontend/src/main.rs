@@ -3,6 +3,7 @@ pub mod styles;
 pub mod views;
 pub mod ws_client;
 
+use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 use dioxus::prelude::*;
 use shared::dto::UserProfile;
 use uuid::Uuid;
@@ -12,7 +13,15 @@ use crate::styles::APP_CSS;
 use crate::views::{AuthView, DashboardView, ListDetailView};
 
 fn main() {
-    dioxus::launch(App);
+    let cfg = Config::new()
+        .with_window(
+            WindowBuilder::new()
+                .with_title("App Compras Colaborativo")
+                .with_inner_size(LogicalSize::new(500.0, 850.0))
+                .with_visible(true),
+        );
+
+    LaunchBuilder::desktop().with_cfg(cfg).launch(App);
 }
 
 #[component]
