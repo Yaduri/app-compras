@@ -1,6 +1,5 @@
 use dioxus::prelude::*;
 use shared::dto::{LoginRequest, RegisterRequest, UserProfile};
-use uuid::Uuid;
 
 use crate::api::ApiClient;
 
@@ -65,37 +64,6 @@ pub fn AuthView(
                 }
                 Err(err) => {
                     error_msg.set(Some(err));
-                }
-            }
-        });
-    };
-
-    let handle_demo_login = move |_| {
-        let client = api_client.read().clone();
-        is_loading.set(true);
-        error_msg.set(None);
-
-        spawn(async move {
-            // Tenta o endpoint oficial /api/auth/demo
-            let demo_res = client.demo().await;
-            is_loading.set(false);
-
-            match demo_res {
-                Ok(auth_res) => {
-                    auth_token.set(Some(auth_res.token.clone()));
-                    current_user.set(Some(auth_res.user));
-                    api_client.set(ApiClient::new(Some(client.base_url), Some(auth_res.token)));
-                }
-                Err(_) => {
-                    // Fallback imediato: sessão demo local
-                    let demo_user = UserProfile {
-                        id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
-                        email: "demo@mercado.com".to_string(),
-                        name: "Usuário Demo".to_string(),
-                        avatar_url: None,
-                    };
-                    auth_token.set(Some("demo-local-token".to_string()));
-                    current_user.set(Some(demo_user));
                 }
             }
         });
@@ -189,18 +157,6 @@ pub fn AuthView(
                     } else {
                         "Entrar"
                     }
-                }
-
-                div { style: "text-align: center; margin: 20px 0 14px 0; color: var(--text-muted); font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em;",
-                    "— OU CONTINUE COM —"
-                }
-
-                button {
-                    class: "btn btn-secondary",
-                    style: "width: 100%; font-weight: 600; font-size: 0.88rem;",
-                    disabled: *is_loading.read(),
-                    onclick: handle_demo_login,
-                    "Acesso Rápido Demo (1 Clique)"
                 }
             }
         }
