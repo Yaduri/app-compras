@@ -24,7 +24,16 @@ echo [3/3] Iniciando compilacao via Dioxus CLI...
 
 cd frontend
 dx build --release --platform android
+cd ..
+
+if not exist "dist" mkdir "dist"
+if exist "target\dx\frontend\release\android\app\app\build\outputs\apk\debug\app-debug.apk" (
+    copy /Y "target\dx\frontend\release\android\app\app\build\outputs\apk\debug\app-debug.apk" "dist\app-compras.apk" >nul
+)
 
 echo.
-echo Concluido! Verifique o APK gerado na pasta dist/ ou target/.
+echo ====================================================
+echo  APK gerado com sucesso!
+echo  Arquivo: dist\app-compras.apk
+echo ====================================================
 pause

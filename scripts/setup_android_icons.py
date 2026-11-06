@@ -28,9 +28,12 @@ if os.path.exists(android_res_base):
     for name, size in densities.items():
         folder = os.path.join(android_res_base, f"mipmap-{name}")
         os.makedirs(folder, exist_ok=True)
+        # Remove png se existir para evitar erro de recurso duplicado com webp
+        png_path = os.path.join(folder, "ic_launcher.png")
+        if os.path.exists(png_path):
+            os.remove(png_path)
         resized = img.resize((size, size), Image.Resampling.LANCZOS)
-        resized.save(os.path.join(folder, "ic_launcher.png"))
-        resized.save(os.path.join(folder, "ic_launcher.webp"))
-        print(f"Icone {name} ({size}x{size}) atualizado com sucesso!")
+        resized.save(os.path.join(folder, "ic_launcher.webp"), format="WEBP")
+        print(f"Icone {name} ({size}x{size}) atualizado com sucesso em WEBP!")
 else:
     print("Projeto Android target ainda nao gerado. Rode o build primeiro.")
