@@ -1,0 +1,16 @@
+[application]
+name = "App Compras"
+default_platform = "desktop"
+out_dir = "dist"
+
+[application.android]
+package = "com.appcompras.lista"
+label = "App Compras"
+min_sdk_version = 24
+target_sdk_version = 34
+
+[web.app]
+title = "App Compras Colaborativo"
+
+[web.watcher]
+reload_html = true
