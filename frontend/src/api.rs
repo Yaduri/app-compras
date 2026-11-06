@@ -68,6 +68,17 @@ impl ApiClient {
         Self::handle_response(res).await
     }
 
+    pub async fn demo(&self) -> Result<AuthResponse, String> {
+        let res = self
+            .client()
+            .post(format!("{}/api/auth/demo", self.base_url))
+            .send()
+            .await
+            .map_err(|e| format!("Falha de conexão com o servidor: {}", e))?;
+
+        Self::handle_response(res).await
+    }
+
     pub async fn register(&self, req: RegisterRequest) -> Result<AuthResponse, String> {
         let res = self
             .client()

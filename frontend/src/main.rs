@@ -44,21 +44,30 @@ fn App() -> Element {
         style { "{APP_CSS}" }
 
         div { class: "app-container",
-            // Header / Navbar
-            header { class: "navbar",
-                h1 {
-                    span { "🛒" }
-                    span { "App Compras" }
-                }
+            // Header / Navbar exibido quando autenticado
+            if current_user.read().is_some() {
+                header { class: "navbar",
+                    h1 {
+                        div { class: "brand-badge", "🛒" }
+                        span { "App Compras" }
+                        div { class: "live-indicator",
+                            span { class: "live-dot" }
+                            span { "Ao vivo" }
+                        }
+                    }
 
-                if let Some(user) = current_user.read().as_ref() {
-                    div { class: "nav-actions",
-                        span { style: "font-size: 0.9rem; font-weight: 500;", "{user.name}" }
-                        button {
-                            class: "btn-icon",
-                            title: "Desconectar",
-                            onclick: handle_logout,
-                            "🚪 Sair"
+                    if let Some(user) = current_user.read().as_ref() {
+                        div { class: "nav-actions",
+                            div { class: "user-chip",
+                                div { class: "user-avatar-circle", "{user.name.chars().next().unwrap_or('U')}" }
+                                span { "{user.name}" }
+                            }
+                            button {
+                                class: "btn-icon",
+                                title: "Desconectar",
+                                onclick: handle_logout,
+                                "Sair"
+                            }
                         }
                     }
                 }

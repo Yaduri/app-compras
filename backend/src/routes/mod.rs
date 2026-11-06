@@ -35,6 +35,7 @@ pub fn create_router(state: AppState) -> Router {
         // Autenticação
         .route("/api/auth/register", post(auth_routes::register))
         .route("/api/auth/login", post(auth_routes::login))
+        .route("/api/auth/demo", post(auth_routes::demo))
         .route("/api/auth/google", post(auth_routes::google_auth))
         .route("/api/auth/me", get(auth_routes::get_me))
         // Listas e Vínculo por Código

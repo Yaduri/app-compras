@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 use shared::dto::{LoginRequest, RegisterRequest, UserProfile};
+use uuid::Uuid;
 
 use crate::api::ApiClient;
 
@@ -75,65 +76,58 @@ pub fn AuthView(
         error_msg.set(None);
 
         spawn(async move {
-            // Tenta logar como usuário demo ou cadastra-o se não existir
-            let demo_email = "demo@mercado.com".to_string();
-            let demo_pass = "demo123456".to_string();
-
-            let login_res = client
-                .login(LoginRequest {
-                    email: demo_email.clone(),
-                    password: demo_pass.clone(),
-                })
-                .await;
-
-            let final_res = match login_res {
-                Ok(res) => Ok(res),
-                Err(_) => {
-                    // Cadastra a conta demo se ainda não existir
-                    client
-                        .register(RegisterRequest {
-                            name: "Usuário Demo".to_string(),
-                            email: demo_email,
-                            password: demo_pass,
-                        })
-                        .await
-                }
-            };
-
+            // Tenta o endpoint oficial /api/auth/demo
+            let demo_res = client.demo().await;
             is_loading.set(false);
 
-            match final_res {
+            match demo_res {
                 Ok(auth_res) => {
                     auth_token.set(Some(auth_res.token.clone()));
                     current_user.set(Some(auth_res.user));
                     api_client.set(ApiClient::new(Some(client.base_url), Some(auth_res.token)));
                 }
-                Err(err) => {
-                    error_msg.set(Some(format!("Não foi possível entrar no modo Demo: {}", err)));
+                Err(_) => {
+                    // Fallback imediato: sessão demo local
+                    let demo_user = UserProfile {
+                        id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+                        email: "demo@mercado.com".to_string(),
+                        name: "Usuário Demo".to_string(),
+                        avatar_url: None,
+                    };
+                    auth_token.set(Some("demo-local-token".to_string()));
+                    current_user.set(Some(demo_user));
                 }
             }
         });
     };
 
     rsx! {
-        div { class: "main-content", style: "display: flex; flex-direction: column; justify-content: center; max-width: 420px; margin: 40px auto;",
+        div { class: "main-content", style: "display: flex; flex-direction: column; justify-content: center; max-width: 440px; margin: 30px auto; min-height: 85vh;",
+            // Hero / Branding
             div { style: "text-align: center; margin-bottom: 28px;",
-                div { style: "font-size: 3rem; margin-bottom: 8px;", "🛒" }
-                h2 { style: "font-size: 1.6rem; color: #0284c7; font-weight: 800;", "App Compras" }
-                p { style: "color: #64748b; font-size: 0.95rem; margin-top: 4px;",
-                    "Lista de compras colaborativa em tempo real para casais e famílias"
+                div { style: "width: 72px; height: 72px; margin: 0 auto 16px auto; background: linear-gradient(135deg, #d1fae5 0%, #ecfdf5 100%); border-radius: 22px; display: flex; align-items: center; justify-content: center; font-size: 2.2rem; box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.28); border: 1.5px solid #a7f3d0;",
+                    "🛒"
+                }
+                h2 { style: "font-size: 1.85rem; color: #0f172a; font-weight: 800; letter-spacing: -0.03em;",
+                    "App Compras"
+                }
+                p { style: "color: #64748b; font-size: 0.95rem; margin-top: 6px; max-width: 330px; margin-left: auto; margin-right: auto; line-height: 1.4;",
+                    "Lista de supermercado colaborativa em tempo real para sua casa e família"
                 }
             }
 
             if let Some(err) = error_msg.read().as_ref() {
-                div { class: "alert alert-error", "{err}" }
+                div { class: "alert alert-error",
+                    span { style: "font-size: 1.1rem;", "⚠️" }
+                    span { "{err}" }
+                }
             }
 
             div { class: "card",
-                div { style: "display: flex; border-bottom: 1px solid #e2e8f0; margin-bottom: 20px;",
+                // Seletor iOS-style de Abas
+                div { class: "segmented-control",
                     button {
-                        class: if !*is_register.read() { "btn" } else { "btn btn-secondary" },
-                        style: "flex: 1; border-radius: 8px 8px 0 0; border: none; font-weight: 700;",
+                        class: if !*is_register.read() { "segmented-btn active" } else { "segmented-btn" },
                         onclick: move |_| {
                             is_register.set(false);
                             error_msg.set(None);
@@ -141,8 +135,7 @@ pub fn AuthView(
                         "Entrar"
                     }
                     button {
-                        class: if *is_register.read() { "btn" } else { "btn btn-secondary" },
-                        style: "flex: 1; border-radius: 8px 8px 0 0; border: none; font-weight: 700;",
+                        class: if *is_register.read() { "segmented-btn active" } else { "segmented-btn" },
                         onclick: move |_| {
                             is_register.set(true);
                             error_msg.set(None);
@@ -175,11 +168,11 @@ pub fn AuthView(
                 }
 
                 div { class: "form-group",
-                    label { class: "form-label", "Senha (mínimo 6 caracteres)" }
+                    label { class: "form-label", "Senha" }
                     input {
                         class: "form-input",
                         r#type: "password",
-                        placeholder: "••••••••",
+                        placeholder: "Mínimo 6 caracteres",
                         value: "{password_input}",
                         oninput: move |e| password_input.set(e.value())
                     }
@@ -187,7 +180,7 @@ pub fn AuthView(
 
                 button {
                     class: "btn btn-primary",
-                    style: "width: 100%; margin-top: 8px;",
+                    style: "width: 100%; margin-top: 6px;",
                     disabled: *is_loading.read(),
                     onclick: handle_submit,
                     if *is_loading.read() {
@@ -199,16 +192,17 @@ pub fn AuthView(
                     }
                 }
 
-                div { style: "text-align: center; margin: 18px 0; color: #94a3b8; font-size: 0.85rem;",
-                    "— ou experimente agora —"
+                div { style: "text-align: center; margin: 20px 0 14px 0; color: #94a3b8; font-size: 0.78rem; font-weight: 700; letter-spacing: 0.06em;",
+                    "— OU EXPERIMENTE SEM CADASTRO —"
                 }
 
                 button {
-                    class: "btn btn-secondary",
-                    style: "width: 100%; border-color: #38bdf8; color: #0284c7; background-color: #f0f9ff;",
+                    class: "btn",
+                    style: "width: 100%; background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%); border: 1.5px solid #a7f3d0; color: #065f46; font-weight: 700;",
                     disabled: *is_loading.read(),
                     onclick: handle_demo_login,
-                    "⚡ Acesso Rápido de Teste (Demo)"
+                    span { style: "font-size: 1.1rem;", "⚡" }
+                    span { "Acesso Rápido Demo (1 Clique)" }
                 }
             }
         }

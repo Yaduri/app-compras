@@ -4,17 +4,24 @@ use sqlx::PgPool;
 use crate::config::SharedConfig;
 use crate::error::AppError;
 use crate::hub::BroadcastHub;
+use crate::memory_db::InMemoryDb;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: SharedConfig,
     pub pool: Option<PgPool>,
+    pub memory: Arc<InMemoryDb>,
     pub hub: Arc<BroadcastHub>,
 }
 
 impl AppState {
     pub fn new(config: SharedConfig, pool: Option<PgPool>, hub: Arc<BroadcastHub>) -> Self {
-        Self { config, pool, hub }
+        Self {
+            config,
+            pool,
+            memory: Arc::new(InMemoryDb::new_seeded()),
+            hub,
+        }
     }
 
     /// Retorna a pool do banco de dados ou erro amigável se DATABASE_URL não estiver configurada
