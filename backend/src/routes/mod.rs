@@ -28,7 +28,8 @@ pub fn create_router(state: AppState) -> Router {
         .allow_headers(Any);
 
     Router::new()
-        // Health check
+        // Health check e rota raiz
+        .route("/", get(health_check))
         .route("/health", get(health_check))
         // Categorias de supermercado
         .route("/api/categories", get(category_routes::list_categories))

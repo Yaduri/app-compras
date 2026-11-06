@@ -32,8 +32,7 @@ RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/
 # Copia o binário do estágio de build
 COPY --from=builder /app/target/release/backend /app/backend
 
-# O Railway injeta a porta dinamicamente na variável PORT
-ENV PORT=3000
+# O Railway injeta a porta dinamicamente na variável PORT (com fallback padrão no código)
 EXPOSE 3000
 
 CMD ["/app/backend"]

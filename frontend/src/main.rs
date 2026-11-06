@@ -13,6 +13,8 @@ use crate::styles::APP_CSS;
 use crate::views::{AuthView, DashboardView, ListDetailView};
 
 fn main() {
+    dotenvy::dotenv().ok();
+
     let cfg = Config::new()
         .with_window(
             WindowBuilder::new()
