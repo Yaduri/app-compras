@@ -15,13 +15,23 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     dotenvy::dotenv().ok();
 
-    #[cfg(feature = "desktop")]
+    #[cfg(target_os = "android")]
+    {
+        dioxus::LaunchBuilder::mobile().launch(App);
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+        dioxus::LaunchBuilder::mobile().launch(App);
+    }
+
+    #[cfg(all(feature = "desktop", not(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))))]
     {
         use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
         let cfg = Config::new()
             .with_window(
                 WindowBuilder::new()
-                    .with_title("App Compras Colaborativo")
+                    .with_title("App Compras")
                     .with_inner_size(LogicalSize::new(500.0, 850.0))
                     .with_visible(true),
             );
@@ -31,12 +41,7 @@ fn main() {
             .launch(App);
     }
 
-    #[cfg(feature = "mobile")]
-    {
-        dioxus::LaunchBuilder::mobile().launch(App);
-    }
-
-    #[cfg(all(not(feature = "desktop"), not(feature = "mobile")))]
+    #[cfg(all(not(feature = "desktop"), not(target_os = "android"), not(target_os = "ios")))]
     {
         dioxus::launch(App);
     }

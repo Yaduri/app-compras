@@ -5,6 +5,7 @@ pub mod list_routes;
 pub mod ws_routes;
 
 use axum::{
+    response::Html,
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
@@ -20,6 +21,91 @@ async fn health_check() -> Json<serde_json::Value> {
     }))
 }
 
+async fn root_handler() -> Html<&'static str> {
+    Html(r##"<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>App Compras</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: #0f172a;
+      color: #f8fafc;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+      text-align: center;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+    .card {
+      background: #1e293b;
+      padding: 32px 24px;
+      border-radius: 20px;
+      max-width: 380px;
+      width: 100%;
+      border: 1px solid #334155;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    .btn {
+      display: inline-block;
+      margin-top: 16px;
+      background: #ffffff;
+      color: #0f172a;
+      text-decoration: none;
+      font-weight: 700;
+      padding: 12px 24px;
+      border-radius: 9999px;
+      font-size: 0.95rem;
+    }
+    .spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid rgba(255,255,255,0.2);
+      border-top-color: #ffffff;
+      border-radius: 50%;
+      animation: spin 1s infinite linear;
+      margin: 0 auto 16px auto;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="loading">
+      <div class="spinner"></div>
+      <h3 style="margin: 0 0 6px 0;">Autenticando...</h3>
+      <p style="color: #94a3b8; font-size: 0.88rem; margin: 0;">Retornando para o App Compras...</p>
+    </div>
+    <div id="action" style="display: none;">
+      <h3 style="color: #10b981; margin: 0 0 6px 0;">Login Concluído!</h3>
+      <p style="color: #94a3b8; font-size: 0.88rem; margin: 0;">Toque no botão abaixo para abrir o app:</p>
+      <a id="deep-link-btn" href="#" class="btn">Abrir no App Compras</a>
+    </div>
+  </div>
+  <script>
+    const hash = window.location.hash || window.location.search || "";
+    if (hash.includes("access_token=")) {
+      const targetUri = "appcompras://auth" + hash;
+      document.getElementById("deep-link-btn").href = targetUri;
+      document.getElementById("action").style.display = "block";
+      document.getElementById("loading").style.display = "none";
+      setTimeout(function() {
+        window.location.href = targetUri;
+      }, 300);
+    } else {
+      document.getElementById("loading").innerHTML = "<h3 style='margin: 0 0 6px 0;'>App Compras API</h3><p style='color: #10b981; margin: 0;'>Servidor online em produção</p>";
+    }
+  </script>
+</body>
+</html>"##)
+}
+
 pub fn create_router(state: AppState) -> Router {
     // Configuração de CORS permissiva para desenvolvimento e mobile
     let cors = CorsLayer::new()
@@ -29,7 +115,7 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         // Health check e rota raiz
-        .route("/", get(health_check))
+        .route("/", get(root_handler))
         .route("/health", get(health_check))
         // Categorias de supermercado
         .route("/api/categories", get(category_routes::list_categories))
