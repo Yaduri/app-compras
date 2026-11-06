@@ -20,10 +20,10 @@ echo [2/3] Sincronizando icones Android em alta resolucao...
 python scripts\setup_android_icons.py
 
 echo.
-echo [3/3] Iniciando compilacao via Dioxus CLI...
+echo [3/3] Iniciando compilacao via Dioxus CLI para ARM64 (Celulares Fisicos)...
 
 cd frontend
-dx build --release --platform android
+dx build --release --platform android --target aarch64-linux-android
 cd ..
 
 if not exist "dist" mkdir "dist"

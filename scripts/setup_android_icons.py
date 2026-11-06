@@ -35,5 +35,10 @@ if os.path.exists(android_res_base):
         resized = img.resize((size, size), Image.Resampling.LANCZOS)
         resized.save(os.path.join(folder, "ic_launcher.webp"), format="WEBP")
         print(f"Icone {name} ({size}x{size}) atualizado com sucesso em WEBP!")
-else:
-    print("Projeto Android target ainda nao gerado. Rode o build primeiro.")
+    # Atualiza strings.xml com o nome elegante do app
+    strings_xml_path = os.path.join(android_res_base, "values", "strings.xml")
+    if os.path.exists(strings_xml_path):
+        with open(strings_xml_path, "w", encoding="utf-8") as f:
+            f.write('<resources>\n    <string name="app_name">App Compras</string>\n</resources>\n')
+        print("Nome do app atualizado para 'App Compras'!")
+
