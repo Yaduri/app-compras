@@ -152,8 +152,6 @@ pub async fn google_auth(
         return Err(AppError::BadRequest("id_token inválido".to_string()));
     }
 
-    let pool = state.get_pool()?;
-
     // 1. Tenta validar o token no endpoint oficial do Google
     let client = reqwest::Client::new();
     let mut resolved_email = None;
@@ -202,23 +200,38 @@ pub async fn google_auth(
     let name = resolved_name
         .unwrap_or_else(|| email.split('@').next().unwrap_or("Usuário Google").to_string());
 
-    let row = sqlx::query(
-        "INSERT INTO users (email, name, avatar_url) VALUES ($1, $2, $3)
-         ON CONFLICT (email) DO UPDATE SET 
-            name = COALESCE(EXCLUDED.name, users.name),
-            avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url)
-         RETURNING id, email, name, avatar_url",
-    )
-    .bind(&email)
-    .bind(&name)
-    .bind(&resolved_avatar)
-    .fetch_one(pool)
-    .await?;
+    let (user_id, user_name, user_email, avatar_url) = if let Some(pool) = &state.pool {
+        let row = sqlx::query(
+            "INSERT INTO users (email, name, avatar_url) VALUES ($1, $2, $3)
+             ON CONFLICT (email) DO UPDATE SET 
+                name = COALESCE(EXCLUDED.name, users.name),
+                avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url)
+             RETURNING id, email, name, avatar_url",
+        )
+        .bind(&email)
+        .bind(&name)
+        .bind(&resolved_avatar)
+        .fetch_one(pool)
+        .await?;
 
-    let user_id: Uuid = row.try_get("id")?;
-    let user_name: String = row.try_get("name")?;
-    let user_email: String = row.try_get("email")?;
-    let avatar_url: Option<String> = row.try_get("avatar_url")?;
+        (
+            row.try_get("id")?,
+            row.try_get("name")?,
+            row.try_get("email")?,
+            row.try_get("avatar_url")?,
+        )
+    } else {
+        let existing = state.memory.find_user_by_email(&email).await;
+        if let Some((u, _)) = existing {
+            (u.id, u.name, u.email, u.avatar_url)
+        } else {
+            let u = state
+                .memory
+                .create_user(name.clone(), email.clone(), "".to_string())
+                .await?;
+            (u.id, u.name, u.email, u.avatar_url)
+        }
+    };
 
     let token = create_jwt(user_id, &user_email, &user_name, &state.config.jwt_secret)?;
 
