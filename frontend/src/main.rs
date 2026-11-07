@@ -53,7 +53,7 @@ fn App() -> Element {
     let mut current_user = use_signal(|| None::<UserProfile>);
     let mut auth_token = use_signal(|| None::<String>);
     let mut active_list_id = use_signal(|| None::<Uuid>);
-    let error_msg = use_signal(|| None::<String>);
+    let mut error_msg = use_signal(|| None::<String>);
     let success_msg = use_signal(|| None::<String>);
 
     let handle_logout = move |_| {
@@ -63,26 +63,40 @@ fn App() -> Element {
         api_client.set(ApiClient::new(None, None));
     };
 
-    // Auto-login se houver callback do Google / Supabase na URL
+    // Auto-login se houver callback do Google / Supabase na URL ou via Intent nativo
     use_effect(move || {
         let client = api_client.read().clone();
         spawn(async move {
             let mut eval = document::eval(
                 r#"
-                let hash = window.location.hash || window.location.search || "";
-                dioxus.send(hash);
+                function sendHashIfPresent() {
+                    let hash = window.location.hash || window.location.search || "";
+                    if (hash.includes("access_token=")) {
+                        dioxus.send(hash);
+                    }
+                }
+                window.addEventListener("hashchange", sendHashIfPresent);
+                window.onAppComprasToken = function(h) {
+                    dioxus.send(h);
+                };
+                sendHashIfPresent();
                 "#,
             );
-            if let Ok(val) = eval.recv::<String>().await {
+            while let Ok(val) = eval.recv::<String>().await {
                 if val.contains("access_token=") {
                     let token_part = val.split("access_token=").nth(1).unwrap_or("");
                     let access_token = token_part.split('&').next().unwrap_or("");
                     if !access_token.is_empty() {
-                        if let Ok(res) = client.google_auth(access_token.to_string()).await {
-                            auth_token.set(Some(res.token.clone()));
-                            current_user.set(Some(res.user));
-                            api_client.set(ApiClient::new(Some(client.base_url), Some(res.token)));
-                            let _ = document::eval("window.history.replaceState({}, document.title, window.location.pathname);");
+                        match client.google_auth(access_token.to_string()).await {
+                            Ok(res) => {
+                                auth_token.set(Some(res.token.clone()));
+                                current_user.set(Some(res.user));
+                                api_client.set(ApiClient::new(Some(client.base_url.clone()), Some(res.token)));
+                                let _ = document::eval("window.history.replaceState({}, document.title, window.location.pathname);");
+                            }
+                            Err(e) => {
+                                error_msg.set(Some(format!("Falha na autenticação Google: {}", e)));
+                            }
                         }
                     }
                 }

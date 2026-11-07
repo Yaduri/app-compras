@@ -3,3 +3,5 @@
 **/*.rs.bk
 Thumbs.db
 .DS_Store
+
+dist/
