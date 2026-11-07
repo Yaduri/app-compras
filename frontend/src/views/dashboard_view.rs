@@ -24,6 +24,8 @@ pub fn DashboardView(
     let mut show_join_modal = use_signal(|| false);
     let mut join_code_input = use_signal(String::new);
 
+    let mut list_to_delete = use_signal(|| None::<(Uuid, String)>);
+
     // Carrega listas do usuário
     let mut load_lists = move || {
         let client = api_client.read().clone();
@@ -31,25 +33,7 @@ pub fn DashboardView(
         spawn(async move {
             match client.list_user_lists().await {
                 Ok(data) => {
-                    if data.is_empty() {
-                        let demo_list = ListSummaryResponse {
-                            id: Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
-                            name: "Churrasco do Fim de Semana".to_string(),
-                            description: Some("Lista colaborativa para o churrasco com a família e amigos".to_string()),
-                            invite_code: "CHURRAS".to_string(),
-                            role: MemberRole::Owner,
-                            member_count: 1,
-                            totals: shared::dto::ListTotals {
-                                total_items: 5,
-                                purchased_items: 2,
-                                total_planned: 206.40,
-                                total_cart: 48.30,
-                            },
-                        };
-                        lists.set(vec![demo_list]);
-                    } else {
-                        lists.set(data);
-                    }
+                    lists.set(data);
                 }
                 Err(_) => {
                     let demo_list = ListSummaryResponse {
@@ -232,6 +216,8 @@ pub fn DashboardView(
                     for list in lists.read().iter() {
                         {
                             let list_id = list.id;
+                            let lid = list.id;
+                            let lname = list.name.clone();
                             let progress_pct = if list.totals.total_items > 0 {
                                 (list.totals.purchased_items as f64 / list.totals.total_items as f64) * 100.0
                             } else {
@@ -258,6 +244,16 @@ pub fn DashboardView(
                                             }
                                             if list.role == MemberRole::Owner {
                                                 span { class: "badge", style: "background: #f1f5f9; color: #0f172a; font-weight: 600;", "Dono" }
+                                                button {
+                                                    class: "btn-icon-subtle",
+                                                    style: "background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.2); color: #ef4444; border-radius: 8px; padding: 4px 8px; font-size: 0.82rem; cursor: pointer;",
+                                                    title: "Excluir lista",
+                                                    onclick: move |e: MouseEvent| {
+                                                        e.stop_propagation();
+                                                        list_to_delete.set(Some((lid, lname.clone())));
+                                                    },
+                                                    "🗑️"
+                                                }
                                             } else {
                                                 span { class: "badge", style: "background: #f1f5f9; color: #64748b; font-weight: 500;", "Membro" }
                                             }
@@ -362,6 +358,50 @@ pub fn DashboardView(
                                 class: "btn btn-primary",
                                 onclick: handle_join_list,
                                 "Entrar na Lista"
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Modal: Confirmação de Exclusão de Lista
+            if let Some((del_id, del_name)) = list_to_delete.read().clone() {
+                div { class: "modal-overlay",
+                    div { class: "card",
+                        style: "max-width: 380px; width: 100%; border-radius: 20px; padding: 24px; box-shadow: 0 20px 40px rgba(0,0,0,0.25); border: 1px solid var(--border-light); background: var(--bg-card);",
+                        h3 { style: "color: #ef4444; font-size: 1.2rem; font-weight: 700; margin-bottom: 8px;", "Excluir Lista?" }
+                        p { style: "color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 24px; line-height: 1.45;",
+                            "Tem certeza que deseja excluir permanentemente a lista "
+                            strong { style: "color: var(--text-primary);", "\"{del_name}\"" }
+                            "? Todos os itens da lista serão apagados."
+                        }
+                        div { style: "display: flex; justify-content: flex-end; gap: 10px;",
+                            button {
+                                class: "btn btn-secondary",
+                                style: "padding: 8px 18px;",
+                                onclick: move |_| list_to_delete.set(None),
+                                "Cancelar"
+                            }
+                            button {
+                                class: "btn",
+                                style: "background: #ef4444; color: #ffffff; border: none; padding: 8px 18px; font-weight: 700; border-radius: 9999px; cursor: pointer; box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);",
+                                onclick: move |_| {
+                                    let client = api_client.read().clone();
+                                    let target_id = del_id;
+                                    list_to_delete.set(None);
+                                    spawn(async move {
+                                        match client.delete_list(target_id).await {
+                                            Ok(_) => {
+                                                success_msg.set(Some("Lista excluída com sucesso!".to_string()));
+                                                load_lists();
+                                            }
+                                            Err(err) => {
+                                                error_msg.set(Some(err));
+                                            }
+                                        }
+                                    });
+                                },
+                                "Sim, Excluir"
                             }
                         }
                     }

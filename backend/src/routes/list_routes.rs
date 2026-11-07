@@ -379,19 +379,25 @@ pub async fn delete_list(
     user: AuthenticatedUser,
     Path(list_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let pool = state.get_pool()?;
-    let role = verify_membership(pool, list_id, user.id).await?;
+    if let Some(pool) = &state.pool {
+        let role = verify_membership(pool, list_id, user.id).await?;
 
-    if role != MemberRole::Owner {
-        return Err(AppError::Forbidden(
-            "Apenas o criador/proprietário pode excluir esta lista".to_string(),
-        ));
+        if role != MemberRole::Owner {
+            return Err(AppError::Forbidden(
+                "Apenas o criador/proprietário pode excluir esta lista".to_string(),
+            ));
+        }
+
+        sqlx::query("DELETE FROM lists WHERE id = $1")
+            .bind(list_id)
+            .execute(pool)
+            .await?;
+    } else {
+        let mut lists = state.memory.lists.write().await;
+        lists.remove(&list_id);
+        let mut items = state.memory.items.write().await;
+        items.retain(|_, item| item.list_id != list_id);
     }
-
-    sqlx::query("DELETE FROM lists WHERE id = $1")
-        .bind(list_id)
-        .execute(pool)
-        .await?;
 
     Ok(Json(serde_json::json!({
         "status": "success",

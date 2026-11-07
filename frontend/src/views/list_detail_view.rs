@@ -53,6 +53,9 @@ pub fn ListDetailView(
     // Gaveta / Bottom Sheet de Adição Rápida
     let mut show_add_drawer = use_signal(|| false);
 
+    // Confirmação de exclusão da lista
+    let mut show_delete_modal = use_signal(|| false);
+
     // Formulário de adição rápida
     let mut new_item_name = use_signal(String::new);
     let mut new_item_qty = use_signal(|| "1".to_string());
@@ -517,6 +520,13 @@ pub fn ListDetailView(
                             title: "Código da Lista",
                             "{d.list.invite_code}"
                         }
+                        button {
+                            class: "btn btn-secondary",
+                            style: "padding: 6px 10px; font-size: 0.82rem; color: #ef4444; border-color: rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.05);",
+                            title: "Excluir Lista",
+                            onclick: move |_| show_delete_modal.set(true),
+                            "🗑️"
+                        }
                     }
                 }
             }
@@ -672,6 +682,15 @@ pub fn ListDetailView(
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        div { style: "margin-top: 48px; margin-bottom: 80px; text-align: center;",
+                            button {
+                                class: "btn btn-secondary",
+                                style: "color: #ef4444; border-color: rgba(239, 68, 68, 0.25); background: transparent; font-size: 0.85rem; padding: 10px 20px;",
+                                onclick: move |_| show_delete_modal.set(true),
+                                "🗑️ Excluir esta lista permanentemente"
                             }
                         }
 
@@ -846,6 +865,51 @@ pub fn ListDetailView(
                     }
                 }
             }
+
+            // Modal: Confirmação de Exclusão de Lista
+            if *show_delete_modal.read() {
+                if let Some(d) = detail.read().as_ref() {
+                    div { class: "modal-overlay",
+                        div { class: "card",
+                            style: "max-width: 380px; width: 100%; border-radius: 20px; padding: 24px; box-shadow: 0 20px 40px rgba(0,0,0,0.25); border: 1px solid var(--border-light); background: var(--bg-card);",
+                            h3 { style: "color: #ef4444; font-size: 1.2rem; font-weight: 700; margin-bottom: 8px;", "Excluir Lista?" }
+                            p { style: "color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 24px; line-height: 1.45;",
+                                "Tem certeza que deseja excluir permanentemente a lista "
+                                strong { style: "color: var(--text-primary);", "\"{d.list.name}\"" }
+                                "? Todos os itens associados serão removidos e essa ação não pode ser desfeita."
+                            }
+                                div { style: "display: flex; justify-content: flex-end; gap: 10px;",
+                                    button {
+                                        class: "btn btn-secondary",
+                                        style: "padding: 8px 18px;",
+                                        onclick: move |_| show_delete_modal.set(false),
+                                        "Cancelar"
+                                    }
+                                    button {
+                                        class: "btn",
+                                        style: "background: #ef4444; color: #ffffff; border: none; padding: 8px 18px; font-weight: 700; border-radius: 9999px; cursor: pointer; box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);",
+                                        onclick: move |_| {
+                                            let client = api_client.read().clone();
+                                            show_delete_modal.set(false);
+                                            spawn(async move {
+                                                match client.delete_list(list_id).await {
+                                                    Ok(_) => {
+                                                        success_msg.set(Some("Lista excluída com sucesso!".to_string()));
+                                                        active_list_id.set(None);
+                                                    }
+                                                    Err(err) => {
+                                                        error_msg.set(Some(err));
+                                                    }
+                                                }
+                                            });
+                                        },
+                                        "Sim, Excluir"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
-}
