@@ -58,6 +58,7 @@ pub fn AuthView(
 
             match result {
                 Ok(auth_res) => {
+                    crate::storage::save_session(&auth_res.token, &auth_res.user);
                     auth_token.set(Some(auth_res.token.clone()));
                     current_user.set(Some(auth_res.user));
                     api_client.set(ApiClient::new(Some(client.base_url), Some(auth_res.token)));

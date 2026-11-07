@@ -1,10 +1,10 @@
 pub mod api;
+pub mod storage;
 pub mod styles;
 pub mod views;
 pub mod ws_client;
 
 use dioxus::prelude::*;
-use shared::dto::UserProfile;
 use uuid::Uuid;
 
 use crate::api::ApiClient;
@@ -49,9 +49,13 @@ fn main() {
 
 #[component]
 fn App() -> Element {
-    let mut api_client = use_signal(|| ApiClient::new(None, None));
-    let mut current_user = use_signal(|| None::<UserProfile>);
-    let mut auth_token = use_signal(|| None::<String>);
+    let initial_session = crate::storage::load_session_fs();
+    let initial_token = initial_session.as_ref().map(|s| s.token.clone());
+    let initial_user = initial_session.map(|s| s.user);
+
+    let mut api_client = use_signal(|| ApiClient::new(None, initial_token.clone()));
+    let mut current_user = use_signal(|| initial_user);
+    let mut auth_token = use_signal(|| initial_token);
     let mut active_list_id = use_signal(|| None::<Uuid>);
     let mut error_msg = use_signal(|| None::<String>);
     let success_msg = use_signal(|| None::<String>);
@@ -61,7 +65,45 @@ fn App() -> Element {
         auth_token.set(None);
         active_list_id.set(None);
         api_client.set(ApiClient::new(None, None));
+        crate::storage::clear_session();
     };
+
+    // Restaura sessão salva no localStorage caso o sistema de arquivos ainda não tenha restaurado
+    use_effect(move || {
+        let client = api_client.read().clone();
+        spawn(async move {
+            let mut eval = document::eval(
+                r#"
+                try {
+                    let s = localStorage.getItem("app_compras_session");
+                    dioxus.send(s || "");
+                } catch(e) {
+                    dioxus.send("");
+                }
+                "#,
+            );
+            if let Ok(val) = eval.recv::<String>().await {
+                if !val.trim().is_empty() {
+                    if let Ok(sess) = serde_json::from_str::<crate::storage::StoredSession>(&val) {
+                        if current_user.read().is_none() {
+                            auth_token.set(Some(sess.token.clone()));
+                            current_user.set(Some(sess.user));
+                            let new_client = ApiClient::new(Some(client.base_url.clone()), Some(sess.token.clone()));
+                            api_client.set(new_client.clone());
+
+                            spawn(async move {
+                                if new_client.get_me().await.is_err() {
+                                    auth_token.set(None);
+                                    current_user.set(None);
+                                    crate::storage::clear_session();
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        });
+    });
 
     // Auto-login se houver callback do Google / Supabase na URL ou via Intent nativo
     use_effect(move || {
@@ -89,6 +131,7 @@ fn App() -> Element {
                     if !access_token.is_empty() {
                         match client.google_auth(access_token.to_string()).await {
                             Ok(res) => {
+                                crate::storage::save_session(&res.token, &res.user);
                                 auth_token.set(Some(res.token.clone()));
                                 current_user.set(Some(res.user));
                                 api_client.set(ApiClient::new(Some(client.base_url.clone()), Some(res.token)));
