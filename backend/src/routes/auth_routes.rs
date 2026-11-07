@@ -144,43 +144,90 @@ struct GoogleTokenClaims {
     picture: Option<String>,
 }
 
+#[derive(serde::Deserialize, Debug)]
+struct SupabaseUserMetadata {
+    full_name: Option<String>,
+    name: Option<String>,
+    avatar_url: Option<String>,
+    picture: Option<String>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct SupabaseUserResponse {
+    id: Option<String>,
+    email: Option<String>,
+    user_metadata: Option<SupabaseUserMetadata>,
+}
+
 pub async fn google_auth(
     State(state): State<AppState>,
     Json(payload): Json<GoogleAuthRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    if payload.id_token.trim().is_empty() {
+    let token = payload.id_token.trim();
+    if token.is_empty() {
         return Err(AppError::BadRequest("id_token inválido".to_string()));
     }
 
-    // 1. Tenta validar o token no endpoint oficial do Google
     let client = reqwest::Client::new();
     let mut resolved_email = None;
     let mut resolved_name = None;
     let mut resolved_avatar = None;
 
-    // Tenta validar como id_token oficial do Google
+    // 1. Tenta validar via Supabase Auth (o fluxo OAuth web/mobile usa o Supabase)
+    let supabase_url = state
+        .config
+        .supabase_url
+        .as_deref()
+        .unwrap_or("https://xfzcsdtsjundbhhxqwjm.supabase.co");
+    let supabase_anon_key = state
+        .config
+        .supabase_anon_key
+        .as_deref()
+        .unwrap_or("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhmemNzZHRzanVuZGJoaHhxd2ptIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM5ODcyNDAsImV4cCI6MjEwOTU2MzI0MH0.CsD_qp8y8U1eMFoa2dnsgvnoWMpUPksyXOwdPJJRAfE");
+
     if let Ok(res) = client
-        .get(&format!(
-            "https://oauth2.googleapis.com/tokeninfo?id_token={}",
-            payload.id_token.trim()
-        ))
+        .get(format!("{}/auth/v1/user", supabase_url))
+        .bearer_auth(token)
+        .header("apikey", supabase_anon_key)
         .send()
         .await
     {
         if res.status().is_success() {
-            if let Ok(claims) = res.json::<GoogleTokenClaims>().await {
-                resolved_email = claims.email;
-                resolved_name = claims.name;
-                resolved_avatar = claims.picture;
+            if let Ok(supa_user) = res.json::<SupabaseUserResponse>().await {
+                resolved_email = supa_user.email;
+                if let Some(meta) = supa_user.user_metadata {
+                    resolved_name = meta.full_name.or(meta.name);
+                    resolved_avatar = meta.avatar_url.or(meta.picture);
+                }
             }
         }
     }
 
-    // Se falhar, tenta como access_token via userinfo endpoint
+    // 2. Se não resolveu via Supabase, tenta validar como id_token oficial do Google
+    if resolved_email.is_none() {
+        if let Ok(res) = client
+            .get(&format!(
+                "https://oauth2.googleapis.com/tokeninfo?id_token={}",
+                token
+            ))
+            .send()
+            .await
+        {
+            if res.status().is_success() {
+                if let Ok(claims) = res.json::<GoogleTokenClaims>().await {
+                    resolved_email = claims.email;
+                    resolved_name = claims.name;
+                    resolved_avatar = claims.picture;
+                }
+            }
+        }
+    }
+
+    // 3. Se falhar, tenta como access_token via userinfo endpoint do Google
     if resolved_email.is_none() {
         if let Ok(res) = client
             .get("https://www.googleapis.com/oauth2/v3/userinfo")
-            .bearer_auth(payload.id_token.trim())
+            .bearer_auth(token)
             .send()
             .await
         {
