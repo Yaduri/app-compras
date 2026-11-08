@@ -1,9 +1,11 @@
 use dioxus::prelude::*;
 use shared::dto::{CreateListRequest, JoinListRequest, ListSummaryResponse, UserProfile};
-use shared::models::MemberRole;
 use uuid::Uuid;
 
-use crate::api::ApiClient;
+use crate::api::{ApiClient, ApiError};
+use crate::format::brl;
+use crate::icons::{Icon, IconKind};
+use crate::session::{show_api_error, use_back_layer, Layer, SessionExpired};
 
 #[component]
 pub fn DashboardView(
@@ -13,6 +15,7 @@ pub fn DashboardView(
     error_msg: Signal<Option<String>>,
     success_msg: Signal<Option<String>>,
 ) -> Element {
+    let _ = current_user;
     let mut lists = use_signal(Vec::<ListSummaryResponse>::new);
     let mut is_loading = use_signal(|| false);
 
@@ -24,34 +27,33 @@ pub fn DashboardView(
     let mut show_join_modal = use_signal(|| false);
     let mut join_code_input = use_signal(String::new);
 
-    let mut list_to_delete = use_signal(|| None::<(Uuid, String)>);
+    // Erros de validação/servidor aparecem dentro do próprio modal
+    let mut create_error = use_signal(|| None::<String>);
+    let mut join_error = use_signal(|| None::<String>);
 
-    // Carrega listas do usuário
+    let session = use_context::<SessionExpired>();
+    let mut is_saving = use_signal(|| false);
+
+    use_back_layer(show_create_modal, Layer::CreateList);
+    use_back_layer(show_join_modal, Layer::JoinList);
+
+    // Mostra o erro dentro do modal; sessão expirada continua levando ao login
+    let modal_error = move |err: ApiError, mut target: Signal<Option<String>>| {
+        if err.is_unauthorized() {
+            show_api_error(err, error_msg, session);
+        } else {
+            target.set(Some(err.message));
+        }
+    };
+
+    // Carrega listas do usuário (em caso de erro mantém o que já estava na tela e avisa)
     let mut load_lists = move || {
-        let client = api_client.read().clone();
+        let client = api_client.peek().clone();
         is_loading.set(true);
         spawn(async move {
             match client.list_user_lists().await {
-                Ok(data) => {
-                    lists.set(data);
-                }
-                Err(_) => {
-                    let demo_list = ListSummaryResponse {
-                        id: Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
-                        name: "Churrasco do Fim de Semana".to_string(),
-                        description: Some("Lista colaborativa para o churrasco com a família e amigos".to_string()),
-                        invite_code: "CHURRAS".to_string(),
-                        role: MemberRole::Owner,
-                        member_count: 1,
-                        totals: shared::dto::ListTotals {
-                            total_items: 5,
-                            purchased_items: 2,
-                            total_planned: 206.40,
-                            total_cart: 48.30,
-                        },
-                    };
-                    lists.set(vec![demo_list]);
-                }
+                Ok(data) => lists.set(data),
+                Err(err) => show_api_error(err, error_msg, session),
             }
             is_loading.set(false);
         });
@@ -61,154 +63,144 @@ pub fn DashboardView(
         load_lists();
     });
 
-    let handle_create_list = move |_| {
-        let name = new_list_name.read().clone();
-        let desc = new_list_desc.read().clone();
-        let client = api_client.read().clone();
-
-        if name.trim().is_empty() {
-            error_msg.set(Some("O nome da lista é obrigatório".to_string()));
+    let mut handle_create_list = move || {
+        if *is_saving.peek() {
             return;
         }
+        let name = new_list_name.read().trim().to_string();
+        let desc = new_list_desc.read().trim().to_string();
+        let client = api_client.peek().clone();
 
+        if name.is_empty() {
+            create_error.set(Some("Dê um nome para a lista".to_string()));
+            return;
+        }
+        create_error.set(None);
+
+        is_saving.set(true);
         spawn(async move {
             let req = CreateListRequest {
-                name: name.trim().to_string(),
-                description: if desc.trim().is_empty() {
-                    None
-                } else {
-                    Some(desc.trim().to_string())
-                },
+                name,
+                description: if desc.is_empty() { None } else { Some(desc) },
             };
 
-            match client.create_list(req.clone()).await {
+            match client.create_list(req).await {
                 Ok(created) => {
                     show_create_modal.set(false);
                     new_list_name.set(String::new());
                     new_list_desc.set(String::new());
-                    success_msg.set(Some(format!("Lista '{}' criada com sucesso!", created.name)));
-                    load_lists();
+                    error_msg.set(None);
+                    success_msg.set(None);
+                    // Abre a lista recém-criada: o próximo passo é adicionar itens
+                    active_list_id.set(Some(created.id));
                 }
-                Err(_) => {
-                    // Fallback para modo demo / offline
-                    let new_id = Uuid::new_v4();
-                    let new_summary = ListSummaryResponse {
-                        id: new_id,
-                        name: req.name.clone(),
-                        description: req.description.clone(),
-                        invite_code: format!("DEMO-{}", &new_id.to_string()[0..4].to_uppercase()),
-                        role: MemberRole::Owner,
-                        member_count: 1,
-                        totals: shared::dto::ListTotals {
-                            total_items: 0,
-                            purchased_items: 0,
-                            total_planned: 0.0,
-                            total_cart: 0.0,
-                        },
-                    };
-                    lists.write().push(new_summary);
-                    show_create_modal.set(false);
-                    new_list_name.set(String::new());
-                    new_list_desc.set(String::new());
-                    success_msg.set(Some(format!("Lista '{}' criada com sucesso!", req.name)));
-                }
+                // O modal continua aberto para o usuário tentar de novo
+                Err(err) => modal_error(err, create_error),
             }
+            is_saving.set(false);
         });
     };
 
-    let handle_join_list = move |_| {
-        let code = join_code_input.read().trim().to_uppercase();
-        let client = api_client.read().clone();
-
-        if code.is_empty() {
-            error_msg.set(Some("Digite o código de convite da lista".to_string()));
+    let mut handle_join_list = move || {
+        if *is_saving.peek() {
             return;
         }
+        let code = join_code_input.read().trim().to_uppercase();
+        let client = api_client.peek().clone();
 
+        if code.is_empty() {
+            join_error.set(Some("Digite o código que você recebeu".to_string()));
+            return;
+        }
+        join_error.set(None);
+
+        is_saving.set(true);
         spawn(async move {
-            let req = JoinListRequest {
-                invite_code: code.clone(),
-            };
+            let req = JoinListRequest { invite_code: code };
 
             match client.join_list(req).await {
                 Ok(joined) => {
                     show_join_modal.set(false);
                     join_code_input.set(String::new());
-                    success_msg.set(Some(format!(
-                        "Você entrou na lista '{}' com sucesso!",
-                        joined.name
-                    )));
+                    success_msg.set(Some(format!("Você entrou na lista \"{}\"", joined.name)));
+                    error_msg.set(None);
                     load_lists();
                 }
-                Err(err) => {
-                    error_msg.set(Some(err));
-                }
+                Err(err) => modal_error(err, join_error),
             }
+            is_saving.set(false);
         });
     };
 
-    let user_name = current_user
-        .read()
-        .as_ref()
-        .map(|u| u.name.clone())
-        .unwrap_or_else(|| "Visitante".to_string());
+    let mut open_create = move || {
+        create_error.set(None);
+        show_create_modal.set(true);
+    };
 
     rsx! {
         div { class: "main-content",
-            // Header do Dashboard
-            div { style: "display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border-light);",
+            div { class: "page-header",
                 div {
-                    h2 { style: "font-size: 1.5rem; font-weight: 800; letter-spacing: -0.025em; color: var(--text-primary);", "{user_name}" }
-                    p { style: "color: var(--text-secondary); font-size: 0.85rem; margin-top: 2px;", "Listas de compras compartilhadas" }
+                    h1 { class: "page-title", "Suas listas" }
+                    p { class: "page-subtitle", "Compartilhe o código de uma lista para comprar junto" }
                 }
-                div { style: "display: flex; gap: 8px;",
+                div { class: "page-actions",
                     button {
                         class: "btn btn-primary",
-                        onclick: move |_| show_create_modal.set(true),
-                        "+ Nova Lista"
+                        onclick: move |_| open_create(),
+                        Icon { kind: IconKind::Plus, size: 18 }
+                        "Nova lista"
                     }
                     button {
                         class: "btn btn-secondary",
-                        onclick: move |_| show_join_modal.set(true),
-                        "Inserir Código"
+                        onclick: move |_| {
+                            join_error.set(None);
+                            show_join_modal.set(true);
+                        },
+                        "Entrar com código"
                     }
                 }
             }
 
             // Notificações
             if let Some(err) = error_msg.read().as_ref() {
-                div { class: "alert alert-error",
-                    div { style: "display: flex; justify-content: space-between; width: 100%;",
-                        span { "{err}" }
-                        span { style: "cursor: pointer; font-weight: bold;", onclick: move |_| error_msg.set(None), "✕" }
+                div { class: "alert alert-error", role: "alert",
+                    span { "{err}" }
+                    button {
+                        class: "icon-btn",
+                        "aria-label": "Fechar aviso",
+                        onclick: move |_| error_msg.set(None),
+                        Icon { kind: IconKind::X, size: 18 }
                     }
                 }
             }
 
             if let Some(succ) = success_msg.read().as_ref() {
-                div { class: "alert alert-success",
-                    div { style: "display: flex; justify-content: space-between; width: 100%;",
-                        span { "{succ}" }
-                        span { style: "cursor: pointer; font-weight: bold;", onclick: move |_| success_msg.set(None), "✕" }
+                div { class: "alert alert-success", role: "status",
+                    span { "{succ}" }
+                    button {
+                        class: "icon-btn",
+                        "aria-label": "Fechar aviso",
+                        onclick: move |_| success_msg.set(None),
+                        Icon { kind: IconKind::X, size: 18 }
                     }
                 }
             }
 
-            // Listagem de Listas
+            // Listagem de listas
             if *is_loading.read() && lists.read().is_empty() {
-                div { style: "text-align: center; padding: 48px; color: var(--text-muted); font-size: 0.9rem;", "Carregando suas listas..." }
+                div { class: "loading-state", "Carregando suas listas..." }
             } else if lists.read().is_empty() {
-                div { class: "inset-group", style: "text-align: center; padding: 48px 20px;",
-                    h3 { style: "color: var(--text-primary); font-size: 1.1rem; font-weight: 700; margin-bottom: 6px;", "Nenhuma lista encontrada" }
-                    p { style: "color: var(--text-secondary); margin-bottom: 20px; font-size: 0.88rem;",
-                        "Crie sua primeira lista ou use um código de convite para participar da lista de alguém."
+                div { class: "card empty-state",
+                    h2 { "Nenhuma lista ainda" }
+                    p { style: "margin-bottom: 20px;",
+                        "Crie sua primeira lista ou entre na lista de alguém com o código de convite."
                     }
-                    div { style: "display: flex; justify-content: center; gap: 12px;",
-                        button {
-                            class: "btn btn-primary",
-                            onclick: move |_| show_create_modal.set(true),
-                            "+ Criar Minha Primeira Lista"
-                        }
+                    button {
+                        class: "btn btn-primary",
+                        onclick: move |_| open_create(),
+                        Icon { kind: IconKind::Plus, size: 18 }
+                        "Criar minha primeira lista"
                     }
                 }
             } else {
@@ -216,72 +208,42 @@ pub fn DashboardView(
                     for list in lists.read().iter() {
                         {
                             let list_id = list.id;
-                            let lid = list.id;
-                            let lname = list.name.clone();
                             let progress_pct = if list.totals.total_items > 0 {
                                 (list.totals.purchased_items as f64 / list.totals.total_items as f64) * 100.0
                             } else {
                                 0.0
                             };
+                            let others = list.member_count.saturating_sub(1);
 
                             rsx! {
-                                div {
+                                button {
                                     key: "{list.id}",
-                                    class: "card",
-                                    style: "cursor: pointer; padding: 18px 20px; margin-bottom: 0; transition: border-color 0.15s ease, transform 0.1s ease;",
+                                    class: "card list-card",
                                     onclick: move |_| active_list_id.set(Some(list_id)),
 
-                                    div { style: "display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;",
-                                        div { style: "flex: 1;",
-                                            h3 { style: "font-size: 1.18rem; font-weight: 700; color: var(--text-primary); margin-bottom: 3px; letter-spacing: -0.015em;", "{list.name}" }
+                                    div { class: "list-card-head",
+                                        div { style: "min-width: 0;",
+                                            h2 { class: "list-card-title", "{list.name}" }
                                             if let Some(desc) = &list.description {
-                                                p { style: "font-size: 0.84rem; color: var(--text-secondary); margin-bottom: 6px; line-height: 1.3;", "{desc}" }
+                                                p { class: "list-card-desc", "{desc}" }
                                             }
                                         }
-                                        div { style: "display: flex; gap: 6px; align-items: center;",
-                                            span { class: "badge badge-code", title: "Código de Convite",
-                                                "{list.invite_code}"
-                                            }
-                                            if list.role == MemberRole::Owner {
-                                                span { class: "badge", style: "background: #f1f5f9; color: #0f172a; font-weight: 600;", "Dono" }
-                                                button {
-                                                    class: "btn-icon-subtle",
-                                                    style: "background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.2); color: #ef4444; border-radius: 8px; padding: 4px 8px; font-size: 0.82rem; cursor: pointer;",
-                                                    title: "Excluir lista",
-                                                    onclick: move |e: MouseEvent| {
-                                                        e.stop_propagation();
-                                                        list_to_delete.set(Some((lid, lname.clone())));
-                                                    },
-                                                    "🗑️"
-                                                }
-                                            } else {
-                                                span { class: "badge", style: "background: #f1f5f9; color: #64748b; font-weight: 500;", "Membro" }
-                                            }
+                                        if others == 1 {
+                                            span { class: "badge", "+1 pessoa" }
+                                        } else if others > 1 {
+                                            span { class: "badge", "+{others} pessoas" }
                                         }
                                     }
 
-                                    // Barra de Progresso Discreta (4px)
-                                    div { style: "width: 100%; height: 4px; background: #f1f5f9; border-radius: 2px; overflow: hidden; margin-top: 10px; margin-bottom: 8px;",
-                                        div { style: "width: {progress_pct:.0}%; height: 100%; background: var(--carbon-dark); border-radius: 2px; transition: width 0.2s ease;" }
+                                    div { class: "progress", "aria-hidden": "true",
+                                        div { class: "progress-fill", style: "width: {progress_pct:.0}%;" }
                                     }
 
-                                    div { style: "display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; color: var(--text-secondary); margin-top: 6px;",
-                                        span {
-                                            "{list.totals.purchased_items} de {list.totals.total_items} no carrinho ({progress_pct:.0}%)"
-                                        }
-                                        span {
-                                            "{list.member_count} participante(s)"
-                                        }
-                                    }
-
-                                    div { style: "display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-light); padding-top: 10px; margin-top: 12px; font-size: 0.88rem;",
-                                        div {
-                                            span { style: "color: var(--text-muted); font-size: 0.8rem;", "Planejado: " }
-                                            strong { style: "color: var(--text-secondary);", "R$ {list.totals.total_planned:.2}" }
-                                        }
-                                        div {
-                                            span { style: "color: var(--text-muted); font-size: 0.8rem;", "No Carrinho: " }
-                                            strong { style: "color: var(--text-primary); font-size: 1rem;", "R$ {list.totals.total_cart:.2}" }
+                                    div { class: "list-card-foot",
+                                        span { "{list.totals.purchased_items} de {list.totals.total_items} no carrinho" }
+                                        span { class: "list-card-total",
+                                            strong { "{brl(list.totals.total_cart)}" }
+                                            " de {brl(list.totals.total_planned)}"
                                         }
                                     }
                                 }
@@ -291,117 +253,109 @@ pub fn DashboardView(
                 }
             }
 
-            // Modal: Criar Nova Lista
+            // Modal: Criar nova lista
             if *show_create_modal.read() {
                 div { class: "modal-overlay",
-                    div { class: "modal-content",
-                        h3 { style: "margin-bottom: 16px; font-size: 1.25rem;", "Criar Nova Lista de Compras" }
-                        div { class: "form-group",
-                            label { class: "form-label", "Nome da Lista" }
-                            input {
-                                class: "form-input",
-                                placeholder: "Ex: Mercado do Mês, Feira de Domingo...",
-                                value: "{new_list_name}",
-                                oninput: move |e| new_list_name.set(e.value())
+                    div {
+                        class: "modal-content",
+                        role: "dialog",
+                        "aria-modal": "true",
+                        "aria-labelledby": "create-title",
+                        h2 { id: "create-title", class: "modal-title", "Nova lista" }
+                        form {
+                            onsubmit: move |e: FormEvent| {
+                                e.prevent_default();
+                                handle_create_list();
+                            },
+                            div { class: "form-group",
+                                label { class: "form-label", r#for: "new-list-name", "Nome" }
+                                input {
+                                    id: "new-list-name",
+                                    class: "form-input",
+                                    autofocus: true,
+                                    placeholder: "Ex: Mercado do mês, Feira de domingo",
+                                    value: "{new_list_name}",
+                                    oninput: move |e| new_list_name.set(e.value())
+                                }
                             }
-                        }
-                        div { class: "form-group",
-                            label { class: "form-label", "Descrição (Opcional)" }
-                            input {
-                                class: "form-input",
-                                placeholder: "Ex: Compras da casa ou churrasco",
-                                value: "{new_list_desc}",
-                                oninput: move |e| new_list_desc.set(e.value())
+                            div { class: "form-group",
+                                label { class: "form-label", r#for: "new-list-desc", "Descrição (opcional)" }
+                                input {
+                                    id: "new-list-desc",
+                                    class: "form-input",
+                                    placeholder: "Ex: Churrasco de sábado",
+                                    value: "{new_list_desc}",
+                                    oninput: move |e| new_list_desc.set(e.value())
+                                }
                             }
-                        }
-                        div { style: "display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;",
-                            button {
-                                class: "btn btn-secondary",
-                                onclick: move |_| show_create_modal.set(false),
-                                "Cancelar"
+                            if let Some(err) = create_error.read().as_ref() {
+                                p { class: "form-error", role: "alert", "{err}" }
                             }
-                            button {
-                                class: "btn btn-primary",
-                                onclick: handle_create_list,
-                                "Criar Lista"
+                            div { class: "modal-actions",
+                                button {
+                                    class: "btn btn-secondary",
+                                    r#type: "button",
+                                    onclick: move |_| show_create_modal.set(false),
+                                    "Cancelar"
+                                }
+                                button {
+                                    class: "btn btn-primary",
+                                    r#type: "submit",
+                                    disabled: *is_saving.read(),
+                                    if *is_saving.read() { "Criando..." } else { "Criar lista" }
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // Modal: Entrar com Código
+            // Modal: Entrar com código
             if *show_join_modal.read() {
                 div { class: "modal-overlay",
-                    div { class: "modal-content",
-                        h3 { style: "margin-bottom: 8px; font-size: 1.25rem;", "Entrar em Lista Compartilhada" }
-                        p { style: "color: #64748b; font-size: 0.9rem; margin-bottom: 16px;",
-                            "Digite o código de convite alfanumérico fornecido por quem criou a lista (ex: CASA-8F2A):"
+                    div {
+                        class: "modal-content",
+                        role: "dialog",
+                        "aria-modal": "true",
+                        "aria-labelledby": "join-title",
+                        h2 { id: "join-title", class: "modal-title", "Entrar em uma lista" }
+                        p { class: "modal-text",
+                            "Peça o código para quem criou a lista. Ele aparece no topo da lista, no formato CASA-8F2A."
                         }
-                        div { class: "form-group",
-                            label { class: "form-label", "Código de Convite" }
-                            input {
-                                class: "form-input",
-                                style: "text-transform: uppercase; font-family: monospace; font-size: 1.2rem; letter-spacing: 2px;",
-                                placeholder: "XXXX-XXXX",
-                                value: "{join_code_input}",
-                                oninput: move |e| join_code_input.set(e.value().to_uppercase())
+                        form {
+                            onsubmit: move |e: FormEvent| {
+                                e.prevent_default();
+                                handle_join_list();
+                            },
+                            div { class: "form-group",
+                                label { class: "form-label", r#for: "join-code", "Código de convite" }
+                                input {
+                                    id: "join-code",
+                                    class: "form-input code-input",
+                                    autofocus: true,
+                                    autocomplete: "off",
+                                    autocapitalize: "characters",
+                                    placeholder: "XXXX-XXXX",
+                                    value: "{join_code_input}",
+                                    oninput: move |e| join_code_input.set(e.value().to_uppercase())
+                                }
                             }
-                        }
-                        div { style: "display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;",
-                            button {
-                                class: "btn btn-secondary",
-                                onclick: move |_| show_join_modal.set(false),
-                                "Cancelar"
+                            if let Some(err) = join_error.read().as_ref() {
+                                p { class: "form-error", role: "alert", "{err}" }
                             }
-                            button {
-                                class: "btn btn-primary",
-                                onclick: handle_join_list,
-                                "Entrar na Lista"
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Modal: Confirmação de Exclusão de Lista
-            if let Some((del_id, del_name)) = list_to_delete.read().clone() {
-                div { class: "modal-overlay",
-                    div { class: "card",
-                        style: "max-width: 380px; width: 100%; border-radius: 20px; padding: 24px; box-shadow: 0 20px 40px rgba(0,0,0,0.25); border: 1px solid var(--border-light); background: var(--bg-card);",
-                        h3 { style: "color: #ef4444; font-size: 1.2rem; font-weight: 700; margin-bottom: 8px;", "Excluir Lista?" }
-                        p { style: "color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 24px; line-height: 1.45;",
-                            "Tem certeza que deseja excluir permanentemente a lista "
-                            strong { style: "color: var(--text-primary);", "\"{del_name}\"" }
-                            "? Todos os itens da lista serão apagados."
-                        }
-                        div { style: "display: flex; justify-content: flex-end; gap: 10px;",
-                            button {
-                                class: "btn btn-secondary",
-                                style: "padding: 8px 18px;",
-                                onclick: move |_| list_to_delete.set(None),
-                                "Cancelar"
-                            }
-                            button {
-                                class: "btn",
-                                style: "background: #ef4444; color: #ffffff; border: none; padding: 8px 18px; font-weight: 700; border-radius: 9999px; cursor: pointer; box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);",
-                                onclick: move |_| {
-                                    let client = api_client.read().clone();
-                                    let target_id = del_id;
-                                    list_to_delete.set(None);
-                                    spawn(async move {
-                                        match client.delete_list(target_id).await {
-                                            Ok(_) => {
-                                                success_msg.set(Some("Lista excluída com sucesso!".to_string()));
-                                                load_lists();
-                                            }
-                                            Err(err) => {
-                                                error_msg.set(Some(err));
-                                            }
-                                        }
-                                    });
-                                },
-                                "Sim, Excluir"
+                            div { class: "modal-actions",
+                                button {
+                                    class: "btn btn-secondary",
+                                    r#type: "button",
+                                    onclick: move |_| show_join_modal.set(false),
+                                    "Cancelar"
+                                }
+                                button {
+                                    class: "btn btn-primary",
+                                    r#type: "submit",
+                                    disabled: *is_saving.read(),
+                                    if *is_saving.read() { "Entrando..." } else { "Entrar na lista" }
+                                }
                             }
                         }
                     }

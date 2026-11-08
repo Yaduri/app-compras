@@ -95,19 +95,34 @@ if os.path.exists(android_res_base):
 import android.content.Intent
 import android.os.Bundle
 import android.webkit.WebView
+import org.json.JSONObject
 
 typealias BuildConfig = com.appcompras.lista.BuildConfig
 
 class MainActivity : WryActivity() {
     private var webViewInstance: WebView? = null
-    private var pendingHash: String? = null
+    private var pendingToken: String? = null
+
+    companion object {
+        // Formato de um JWT: base64url separado por pontos. Qualquer outra coisa é descartada.
+        private val TOKEN_REGEX = Regex("^[A-Za-z0-9._-]{20,8192}$")
+
+        fun extractToken(fragment: String): String? {
+            val token = fragment.removePrefix("#")
+                .split("&")
+                .firstOrNull { it.startsWith("access_token=") }
+                ?.removePrefix("access_token=")
+                ?: return null
+            return if (TOKEN_REGEX.matches(token)) token else null
+        }
+    }
 
     override fun onWebViewCreate(webView: WebView) {
         super.onWebViewCreate(webView)
         webViewInstance = webView
-        pendingHash?.let { hash ->
-            injectHash(hash)
-            pendingHash = null
+        pendingToken?.let { token ->
+            injectToken(token)
+            pendingToken = null
         }
     }
 
@@ -124,26 +139,22 @@ class MainActivity : WryActivity() {
 
     private fun handleIntent(intent: Intent?) {
         val data = intent?.data ?: return
-        if (data.scheme == "appcompras") {
-            val url = data.toString()
-            val hash = if (url.contains("#")) {
-                url.substringAfter("#")
-            } else {
-                data.fragment ?: ""
-            }
-            if (hash.isNotEmpty()) {
-                if (webViewInstance != null) {
-                    injectHash(hash)
-                } else {
-                    pendingHash = hash
-                }
-            }
+        if (data.scheme != "appcompras" || data.host != "auth") return
+        val url = data.toString()
+        val fragment = if (url.contains("#")) url.substringAfter("#") else data.fragment ?: ""
+        val token = extractToken(fragment) ?: return
+        if (webViewInstance != null) {
+            injectToken(token)
+        } else {
+            pendingToken = token
         }
     }
 
-    private fun injectHash(hash: String) {
+    private fun injectToken(token: String) {
+        // JSONObject.quote gera uma string JavaScript escapada: nada vindo do link vira código
+        val payload = JSONObject.quote("#access_token=" + token)
         webViewInstance?.post {
-            val js = "(function(){ window.location.hash = '$hash'; if(window.onAppComprasToken) { window.onAppComprasToken('$hash'); } else { window.dispatchEvent(new HashChangeEvent('hashchange')); } })();"
+            val js = "(function(){ var h = " + payload + "; if (window.onAppComprasToken) { window.onAppComprasToken(h); } else { window.location.hash = h; } })();"
             webViewInstance?.evaluateJavascript(js, null)
         }
     }
@@ -172,6 +183,39 @@ class MainActivity : WryActivity() {
     ): Boolean {
         val uri = request.url
         val url = uri.toString()
+        val host = uri.host ?: ""
+        val isOAuth = (host.endsWith(".supabase.co") && (uri.path ?: "").startsWith("/auth")) ||
+            host == "accounts.google.com"
+        if (isOAuth) {
+            try {
+                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, uri)
+                intent.flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                view.context.startActivity(intent)
+                return true
+            } catch (e: Exception) {
+                Logger.warn("Failed to open external browser: $e")
+            }
+        }
+        if (url.startsWith("appcompras://")) {
+            val fragment = if (url.contains("#")) url.substringAfter("#") else uri.fragment ?: ""
+            val token = MainActivity.extractToken(fragment)
+            if (token != null) {
+                val payload = org.json.JSONObject.quote("#access_token=" + token)
+                val js = "(function(){ var h = " + payload + "; if (window.onAppComprasToken) window.onAppComprasToken(h); else window.location.hash = h; })();"
+                view.evaluateJavascript(js, null)
+            }
+            return true
+        }
+        return shouldOverride(request.url.toString())
+    }"""
+
+        # Versão anterior deste script (com injeção insegura), caso o projeto já tenha sido modificado
+        previous_patch = """    override fun shouldOverrideUrlLoading(
+        view: WebView,
+        request: WebResourceRequest
+    ): Boolean {
+        val uri = request.url
+        val url = uri.toString()
         if (url.contains("supabase.co/auth") || url.contains("accounts.google.com")) {
             try {
                 val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, uri)
@@ -193,8 +237,10 @@ class MainActivity : WryActivity() {
         return shouldOverride(request.url.toString())
     }"""
 
-        if old_method in client_code:
-            client_code = client_code.replace(old_method, new_method)
+        if old_method in client_code or previous_patch in client_code:
+            client_code = client_code.replace(old_method, new_method).replace(previous_patch, new_method)
             with open(webview_client_path, "w", encoding="utf-8") as f:
                 f.write(client_code)
             print("RustWebViewClient.kt configurado com abertura de navegador externo!")
+        elif "MainActivity.extractToken" not in client_code:
+            print("AVISO: RustWebViewClient.kt em formato inesperado; deep link nao configurado.")

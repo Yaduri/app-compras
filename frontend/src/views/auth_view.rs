@@ -16,7 +16,7 @@ pub fn AuthView(
     let mut password_input = use_signal(String::new);
     let mut is_loading = use_signal(|| false);
 
-    let handle_submit = move |_| {
+    let mut handle_submit = move |_: ()| {
         let is_reg = *is_register.read();
         let name = name_input.read().clone();
         let email = email_input.read().clone();
@@ -64,43 +64,47 @@ pub fn AuthView(
                     api_client.set(ApiClient::new(Some(client.base_url), Some(auth_res.token)));
                 }
                 Err(err) => {
-                    error_msg.set(Some(err));
+                    error_msg.set(Some(err.message));
                 }
             }
         });
     };
 
     let handle_google_login = move |_| {
-        let auth_url = "https://xfzcsdtsjundbhhxqwjm.supabase.co/auth/v1/authorize?provider=google&redirect_to=https://app-compras-production.up.railway.app";
-        let _ = document::eval(&format!("window.location.href = '{}';", auth_url));
+        // O Supabase devolve o token para a página da API, que o repassa ao app via deep link
+        let redirect_to = crate::api::url_encode(&api_client.peek().base_url);
+        let auth_url = format!(
+            "{}/auth/v1/authorize?provider=google&redirect_to={}",
+            crate::api::supabase_url(),
+            redirect_to
+        );
+        // Serializado como string JSON para não quebrar o JavaScript
+        if let Ok(url_js) = serde_json::to_string(&auth_url) {
+            crate::storage::mark_oauth_pending();
+            let _ = document::eval(&format!("window.location.href = {};", url_js));
+        }
     };
 
     rsx! {
-        div { class: "main-content", style: "display: flex; flex-direction: column; justify-content: center; max-width: 400px; margin: 40px auto; min-height: 80vh;",
-            // Hero / Branding Minimalista (Linear / Things 3)
-            div { style: "text-align: center; margin-bottom: 32px;",
-                div { style: "width: 56px; height: 56px; margin: 0 auto 16px auto; background: var(--carbon-dark); border-radius: 16px; display: flex; align-items: center; justify-content: center; color: #ffffff; font-size: 1.4rem; font-weight: 800; box-shadow: 0 4px 14px rgba(15, 23, 42, 0.15);",
-                    "✓"
-                }
-                h2 { style: "font-size: 1.6rem; color: var(--text-primary); font-weight: 800; letter-spacing: -0.03em;",
-                    "App Compras"
-                }
-                p { style: "color: var(--text-secondary); font-size: 0.88rem; margin-top: 4px; line-height: 1.4;",
-                    "Listas compartilhadas em tempo real"
-                }
+        div { class: "main-content auth-screen",
+            div { class: "auth-hero",
+                h1 { class: "auth-title", "App Compras" }
+                p { class: "auth-subtitle", "A lista do mercado, compartilhada e em tempo real" }
             }
 
             if let Some(err) = error_msg.read().as_ref() {
-                div { class: "alert alert-error",
+                div { class: "alert alert-error", role: "alert",
                     span { "{err}" }
                 }
             }
 
             div { class: "card",
-                // Seletor Minimalista de Abas
-                div { class: "segmented-control",
+                // Seletor Entrar / Criar conta
+                div { class: "segmented-control", role: "tablist",
                     button {
                         class: if !*is_register.read() { "segmented-btn active" } else { "segmented-btn" },
+                        role: "tab",
+                        "aria-selected": "{!*is_register.read()}",
                         onclick: move |_| {
                             is_register.set(false);
                             error_msg.set(None);
@@ -109,65 +113,79 @@ pub fn AuthView(
                     }
                     button {
                         class: if *is_register.read() { "segmented-btn active" } else { "segmented-btn" },
+                        role: "tab",
+                        "aria-selected": "{*is_register.read()}",
                         onclick: move |_| {
                             is_register.set(true);
                             error_msg.set(None);
                         },
-                        "Criar Conta"
+                        "Criar conta"
                     }
                 }
 
-                if *is_register.read() {
+                // Enter em qualquer campo envia
+                form {
+                    onsubmit: move |e: FormEvent| {
+                        e.prevent_default();
+                        handle_submit(());
+                    },
+
+                    if *is_register.read() {
+                        div { class: "form-group",
+                            label { class: "form-label", r#for: "auth-name", "Seu nome" }
+                            input {
+                                id: "auth-name",
+                                class: "form-input",
+                                autocomplete: "name",
+                                placeholder: "Ex: Maria Silva",
+                                value: "{name_input}",
+                                oninput: move |e| name_input.set(e.value())
+                            }
+                        }
+                    }
+
                     div { class: "form-group",
-                        label { class: "form-label", "Seu Nome Completo" }
+                        label { class: "form-label", r#for: "auth-email", "E-mail" }
                         input {
+                            id: "auth-email",
                             class: "form-input",
-                            placeholder: "Ex: Maria Silva",
-                            value: "{name_input}",
-                            oninput: move |e| name_input.set(e.value())
+                            r#type: "email",
+                            inputmode: "email",
+                            autocomplete: "email",
+                            placeholder: "seu@email.com",
+                            value: "{email_input}",
+                            oninput: move |e| email_input.set(e.value())
+                        }
+                    }
+
+                    div { class: "form-group",
+                        label { class: "form-label", r#for: "auth-password", "Senha" }
+                        input {
+                            id: "auth-password",
+                            class: "form-input",
+                            r#type: "password",
+                            autocomplete: if *is_register.read() { "new-password" } else { "current-password" },
+                            placeholder: "Mínimo 6 caracteres",
+                            value: "{password_input}",
+                            oninput: move |e| password_input.set(e.value())
+                        }
+                    }
+
+                    button {
+                        class: "btn btn-primary btn-block",
+                        r#type: "submit",
+                        disabled: *is_loading.read(),
+                        if *is_loading.read() {
+                            "Carregando..."
+                        } else if *is_register.read() {
+                            "Criar conta"
+                        } else {
+                            "Entrar"
                         }
                     }
                 }
 
-                div { class: "form-group",
-                    label { class: "form-label", "E-mail" }
-                    input {
-                        class: "form-input",
-                        r#type: "email",
-                        placeholder: "seu@email.com",
-                        value: "{email_input}",
-                        oninput: move |e| email_input.set(e.value())
-                    }
-                }
-
-                div { class: "form-group",
-                    label { class: "form-label", "Senha" }
-                    input {
-                        class: "form-input",
-                        r#type: "password",
-                        placeholder: "Mínimo 6 caracteres",
-                        value: "{password_input}",
-                        oninput: move |e| password_input.set(e.value())
-                    }
-                }
-
-                button {
-                    class: "btn btn-primary",
-                    style: "width: 100%; margin-top: 8px;",
-                    disabled: *is_loading.read(),
-                    onclick: handle_submit,
-                    if *is_loading.read() {
-                        "Carregando..."
-                    } else if *is_register.read() {
-                        "Concluir Cadastro"
-                    } else {
-                        "Entrar"
-                    }
-                }
-
-                div { style: "text-align: center; margin: 18px 0 12px 0; color: var(--text-muted); font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em;",
-                    "— OU —"
-                }
+                div { class: "divider", "ou" }
 
                 button {
                     class: "btn-google",
@@ -177,7 +195,7 @@ pub fn AuthView(
                         width: "18",
                         height: "18",
                         view_box: "0 0 24 24",
-                        style: "margin-right: 8px; flex-shrink: 0;",
+                        "aria-hidden": "true",
                         path {
                             fill: "#4285F4",
                             d: "M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"

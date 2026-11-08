@@ -1,17 +1,32 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use dioxus::prelude::*;
 use shared::categories::CategoryId;
 use shared::dto::{
-    CreateItemRequest, FrequentItemResponse, ListDetailResponse, ToggleItemPurchasedRequest,
+    CreateItemRequest, FrequentItemResponse, ListDetailResponse, ToggleItemPurchasedRequest, UserProfile,
 };
-use shared::models::{Item, QuantityUnit};
+use shared::models::{Item, MemberRole, QuantityUnit};
 use shared::ws::WsServerMessage;
 use uuid::Uuid;
 
 use crate::api::ApiClient;
-use crate::ws_client::start_ws_sync;
+use crate::format::{brl, parse_decimal, quantity as fmt_qty};
+use crate::icons::{Icon, IconKind};
+use crate::session::{show_api_error, sleep_ms, use_back_layer, Layer, LiveStatus, SessionExpired};
+use crate::ws_client::{run_ws_sync, WsEvent};
 
-// Função pura de recálculo dos totais da lista
-fn recalculate_totals(d: &mut ListDetailResponse) {
+/// Tempo para desfazer a remoção de um item
+const UNDO_MS: u64 = 5_000;
+/// Tempo de exibição dos avisos de outras pessoas
+const TOAST_MS: u64 = 3_500;
+
+/// Recalcula os totais e mantém a mesma ordem do servidor
+/// (pendentes primeiro, mais recentes no topo)
+fn normalize_detail(d: &mut ListDetailResponse) {
+    d.items
+        .sort_by(|a, b| a.purchased.cmp(&b.purchased).then(b.created_at.cmp(&a.created_at)));
+
     let mut total_planned = 0.0;
     let mut total_cart = 0.0;
     let mut purchased_count = 0;
@@ -31,247 +46,241 @@ fn recalculate_totals(d: &mut ListDetailResponse) {
     d.totals.total_cart = total_cart;
 }
 
+/// Insere ou substitui um item na lista local
+fn upsert_item(d: &mut ListDetailResponse, item: Item) {
+    match d.items.iter().position(|i| i.id == item.id) {
+        Some(pos) => d.items[pos] = item,
+        None => d.items.push(item),
+    }
+    normalize_detail(d);
+}
+
+/// Copia um texto para a área de transferência
+fn copy_to_clipboard(text: &str) {
+    if let Ok(js_text) = serde_json::to_string(text) {
+        let _ = document::eval(&format!(
+            r#"
+            (function (t) {{
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
+                    navigator.clipboard.writeText(t).catch(function () {{}});
+                    return;
+                }}
+                var el = document.createElement("textarea");
+                el.value = t;
+                el.setAttribute("readonly", "");
+                el.style.position = "fixed";
+                el.style.opacity = "0";
+                document.body.appendChild(el);
+                el.select();
+                try {{ document.execCommand("copy"); }} catch (e) {{}}
+                document.body.removeChild(el);
+            }})({js_text});
+            "#
+        ));
+    }
+}
+
 #[component]
 pub fn ListDetailView(
     api_client: Signal<ApiClient>,
+    current_user: Signal<Option<UserProfile>>,
     list_id: Uuid,
     active_list_id: Signal<Option<Uuid>>,
     error_msg: Signal<Option<String>>,
     success_msg: Signal<Option<String>>,
 ) -> Element {
+    let session = use_context::<SessionExpired>();
+    let live = use_context::<LiveStatus>();
+
     let mut detail = use_signal(|| None::<ListDetailResponse>);
     let mut is_loading = use_signal(|| true);
+    let mut load_failed = use_signal(|| false);
 
-    // Modal de Sugestões / Mais Comprados
-    let mut show_suggestions_modal = use_signal(|| false);
+    // Gaveta de sugestões (itens mais comprados)
+    let mut show_suggestions = use_signal(|| false);
     let mut suggestions = use_signal(Vec::<FrequentItemResponse>::new);
     let mut loading_suggestions = use_signal(|| false);
 
-    // Notificação em tempo real (ex: "Maria marcou Leite no carrinho")
-    let mut real_time_alert = use_signal(|| None::<String>);
+    // Aviso temporário (ações de outras pessoas, código copiado...)
+    let mut toast = use_signal(|| None::<String>);
+    let mut toast_seq = use_signal(|| 0u64);
 
-    // Gaveta / Bottom Sheet de Adição Rápida
+    // Item removido que ainda pode ser restaurado
+    let mut undo_delete = use_signal(|| None::<(Item, Arc<AtomicBool>)>);
+
+    // Gaveta de adição rápida
     let mut show_add_drawer = use_signal(|| false);
+    let mut is_saving = use_signal(|| false);
 
     // Confirmação de exclusão da lista
     let mut show_delete_modal = use_signal(|| false);
+
+    // O botão/gesto "voltar" do Android fecha cada camada
+    use_back_layer(show_add_drawer, Layer::AddDrawer);
+    use_back_layer(show_suggestions, Layer::Suggestions);
+    use_back_layer(show_delete_modal, Layer::DeleteList);
 
     // Formulário de adição rápida
     let mut new_item_name = use_signal(String::new);
     let mut new_item_qty = use_signal(|| "1".to_string());
     let mut new_item_unit = use_signal(|| QuantityUnit::Un);
     let mut new_item_price = use_signal(String::new);
+    let mut add_error = use_signal(|| None::<String>);
 
-    // Carregamento inicial da lista
+    let my_id = current_user.peek().as_ref().map(|u| u.id);
+
+    let mut show_toast = move |message: String| {
+        toast.set(Some(message));
+        let seq = {
+            let mut s = toast_seq.write();
+            *s += 1;
+            *s
+        };
+        spawn(async move {
+            sleep_ms(TOAST_MS).await;
+            if *toast_seq.peek() == seq {
+                toast.set(None);
+            }
+        });
+    };
+
+    // Sai da tela quando a lista não existe mais ou o usuário perdeu o acesso
+    let mut leave_list = move |message: String| {
+        error_msg.set(Some(message));
+        active_list_id.set(None);
+    };
+
+    // Carrega (ou recarrega) a lista completa do servidor
     let mut load_detail = move || {
-        let client = api_client.read().clone();
+        let client = api_client.peek().clone();
         is_loading.set(true);
         spawn(async move {
             match client.get_list_detail(list_id).await {
-                Ok(data) => {
+                Ok(mut data) => {
+                    normalize_detail(&mut data);
                     detail.set(Some(data));
+                    load_failed.set(false);
                 }
-                Err(_) => {
-                    // Fallback para lista demo se backend indisponível
-                    let demo_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-                    let target_id = if list_id == demo_id { demo_id } else { list_id };
-                    let sample_items = vec![
-                        Item {
-                            id: Uuid::new_v4(),
-                            list_id: target_id,
-                            category_id: CategoryId::Butcher,
-                            name: "Picanha Bovina 1.5kg".to_string(),
-                            quantity: 1.5,
-                            unit: QuantityUnit::Kg,
-                            estimated_price: Some(115.00),
-                            actual_price: None,
-                            purchased: false,
-                            purchased_at: None,
-                            purchased_by_user_id: None,
-                            purchased_by_user_name: None,
-                            added_by_user_id: Uuid::nil(),
-                            added_by_user_name: Some("Usuário Demo".to_string()),
-                            notes: None,
-                            created_at: chrono::Utc::now(),
-                            updated_at: chrono::Utc::now(),
-                        },
-                        Item {
-                            id: Uuid::new_v4(),
-                            list_id: target_id,
-                            category_id: CategoryId::Butcher,
-                            name: "Linguiça Toscana".to_string(),
-                            quantity: 1.0,
-                            unit: QuantityUnit::Kg,
-                            estimated_price: Some(24.90),
-                            actual_price: Some(23.50),
-                            purchased: true,
-                            purchased_at: Some(chrono::Utc::now()),
-                            purchased_by_user_id: None,
-                            purchased_by_user_name: Some("Usuário Demo".to_string()),
-                            added_by_user_id: Uuid::nil(),
-                            added_by_user_name: Some("Usuário Demo".to_string()),
-                            notes: None,
-                            created_at: chrono::Utc::now(),
-                            updated_at: chrono::Utc::now(),
-                        },
-                        Item {
-                            id: Uuid::new_v4(),
-                            list_id: target_id,
-                            category_id: CategoryId::Produce,
-                            name: "Carvão Vegetal 5kg".to_string(),
-                            quantity: 1.0,
-                            unit: QuantityUnit::Pct,
-                            estimated_price: Some(26.00),
-                            actual_price: Some(24.80),
-                            purchased: true,
-                            purchased_at: Some(chrono::Utc::now()),
-                            purchased_by_user_id: None,
-                            purchased_by_user_name: Some("Usuário Demo".to_string()),
-                            added_by_user_id: Uuid::nil(),
-                            added_by_user_name: Some("Usuário Demo".to_string()),
-                            notes: None,
-                            created_at: chrono::Utc::now(),
-                            updated_at: chrono::Utc::now(),
-                        },
-                        Item {
-                            id: Uuid::new_v4(),
-                            list_id: target_id,
-                            category_id: CategoryId::Produce,
-                            name: "Pão de Alho Tradicional".to_string(),
-                            quantity: 2.0,
-                            unit: QuantityUnit::Pct,
-                            estimated_price: Some(18.00),
-                            actual_price: None,
-                            purchased: false,
-                            purchased_at: None,
-                            purchased_by_user_id: None,
-                            purchased_by_user_name: None,
-                            added_by_user_id: Uuid::nil(),
-                            added_by_user_name: Some("Usuário Demo".to_string()),
-                            notes: None,
-                            created_at: chrono::Utc::now(),
-                            updated_at: chrono::Utc::now(),
-                        },
-                        Item {
-                            id: Uuid::new_v4(),
-                            list_id: target_id,
-                            category_id: CategoryId::Produce,
-                            name: "Cerveja Lata 350ml (Pack com 12)".to_string(),
-                            quantity: 1.0,
-                            unit: QuantityUnit::Cx,
-                            estimated_price: Some(42.50),
-                            actual_price: None,
-                            purchased: false,
-                            purchased_at: None,
-                            purchased_by_user_id: None,
-                            purchased_by_user_name: None,
-                            added_by_user_id: Uuid::nil(),
-                            added_by_user_name: Some("Usuário Demo".to_string()),
-                            notes: None,
-                            created_at: chrono::Utc::now(),
-                            updated_at: chrono::Utc::now(),
-                        },
-                    ];
-                    let mut resp = ListDetailResponse {
-                        list: shared::models::List {
-                            id: target_id,
-                            name: "Churrasco do Fim de Semana".to_string(),
-                            description: Some("Lista colaborativa para o churrasco com a família e amigos".to_string()),
-                            invite_code: "CHURRAS".to_string(),
-                            created_by: Uuid::nil(),
-                            created_at: chrono::Utc::now(),
-                            updated_at: chrono::Utc::now(),
-                        },
-                        members: vec![],
-                        items: sample_items,
-                        totals: shared::dto::ListTotals {
-                            total_items: 5,
-                            purchased_items: 2,
-                            total_planned: 226.40,
-                            total_cart: 48.30,
-                        },
-                    };
-                    recalculate_totals(&mut resp);
-                    detail.set(Some(resp));
+                Err(err) if err.is_forbidden_or_missing() => leave_list(err.message),
+                Err(err) => {
+                    load_failed.set(true);
+                    show_api_error(err, error_msg, session);
                 }
             }
             is_loading.set(false);
         });
     };
 
-    // Inicialização e WebSocket Sync
-    use_effect(move || {
+    // Ao sair da tela, o indicador "Ao vivo" é desligado
+    use_drop(move || {
+        let mut status = live.0;
+        status.set(false);
+    });
+
+    // Carregamento inicial + sincronização em tempo real (roda uma vez por lista)
+    use_hook(move || {
         load_detail();
 
-        // Inicia sincronização em tempo real via WebSocket usando canal seguro MPSC
-        let client = api_client.read().clone();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsServerMessage>();
+        let client = api_client.peek().clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsEvent>();
 
         spawn(async move {
-            start_ws_sync(client.base_url, list_id, client.token, tx).await;
+            run_ws_sync(client.base_url, list_id, client.token, tx).await;
         });
 
         spawn(async move {
+            let mut status = live.0;
+            let mut connected_before = false;
+
             while let Some(event) = rx.recv().await {
-                match event {
-                    WsServerMessage::ItemAdded { item, actor_name, .. } => {
-                        real_time_alert.set(Some(format!("✨ {} adicionou '{}'", actor_name, item.name)));
+                let message = match event {
+                    WsEvent::Connected => {
+                        status.set(true);
+                        // Após uma reconexão, eventos podem ter sido perdidos: recarrega
+                        if connected_before {
+                            load_detail();
+                        }
+                        connected_before = true;
+                        continue;
+                    }
+                    WsEvent::Disconnected => {
+                        status.set(false);
+                        continue;
+                    }
+                    WsEvent::Message(m) => m,
+                };
+
+                // As próprias ações já estão na tela: não viram aviso
+                let from_other = |actor: Uuid| Some(actor) != my_id;
+
+                match message {
+                    WsServerMessage::ItemAdded { item, actor_id, actor_name, .. } => {
+                        if from_other(actor_id) {
+                            show_toast(format!("{} adicionou {}", actor_name, item.name));
+                        }
                         if let Some(d) = detail.write().as_mut() {
-                            if !d.items.iter().any(|i| i.id == item.id) {
-                                d.items.push(item);
-                            }
-                            recalculate_totals(d);
+                            upsert_item(d, item);
                         }
                     }
                     WsServerMessage::ItemPurchasedToggled {
                         item_id,
                         purchased,
                         actual_price,
+                        actor_id,
                         actor_name,
                         ..
                     } => {
-                        let mut item_name_affected = String::new();
+                        let mut item_name = String::new();
                         if let Some(d) = detail.write().as_mut() {
                             if let Some(target) = d.items.iter_mut().find(|i| i.id == item_id) {
                                 target.purchased = purchased;
                                 target.actual_price = actual_price;
-                                target.purchased_by_user_name = if purchased {
-                                    Some(actor_name.clone())
-                                } else {
-                                    None
-                                };
-                                item_name_affected = target.name.clone();
+                                target.purchased_by_user_name = if purchased { Some(actor_name.clone()) } else { None };
+                                item_name = target.name.clone();
                             }
-                            recalculate_totals(d);
+                            normalize_detail(d);
                         }
-
-                        let action_text = if purchased { "marcou no carrinho" } else { "desmarcou" };
-                        real_time_alert.set(Some(format!("🛒 {} {} '{}'", actor_name, action_text, item_name_affected)));
+                        if from_other(actor_id) && !item_name.is_empty() {
+                            let action = if purchased { "pegou" } else { "devolveu" };
+                            show_toast(format!("{} {} {}", actor_name, action, item_name));
+                        }
                     }
-                    WsServerMessage::ItemUpdated { item, actor_name, .. } => {
-                        real_time_alert.set(Some(format!("✏️ {} editou '{}'", actor_name, item.name)));
+                    WsServerMessage::ItemUpdated { item, actor_id, actor_name, .. } => {
+                        if from_other(actor_id) {
+                            show_toast(format!("{} editou {}", actor_name, item.name));
+                        }
                         if let Some(d) = detail.write().as_mut() {
-                            if let Some(pos) = d.items.iter().position(|i| i.id == item.id) {
-                                d.items[pos] = item;
-                            }
-                            recalculate_totals(d);
+                            upsert_item(d, item);
                         }
                     }
-                    WsServerMessage::ItemDeleted { item_id, actor_name, .. } => {
-                        real_time_alert.set(Some(format!("🗑️ {} removeu um item", actor_name)));
+                    WsServerMessage::ItemDeleted { item_id, actor_id, actor_name, .. } => {
+                        if from_other(actor_id) {
+                            show_toast(format!("{} removeu um item", actor_name));
+                        }
                         if let Some(d) = detail.write().as_mut() {
                             d.items.retain(|i| i.id != item_id);
-                            recalculate_totals(d);
+                            normalize_detail(d);
                         }
                     }
                     WsServerMessage::MemberJoined { member, .. } => {
-                        real_time_alert.set(Some(format!("👋 {} entrou na lista!", member.name)));
+                        show_toast(format!("{} entrou na lista", member.name));
                         if let Some(d) = detail.write().as_mut() {
                             if !d.members.iter().any(|m| m.user_id == member.user_id) {
                                 d.members.push(member);
                             }
                         }
                     }
+                    WsServerMessage::ListUpdated { name, description, .. } => {
+                        if let Some(d) = detail.write().as_mut() {
+                            d.list.name = name;
+                            d.list.description = description;
+                        }
+                    }
+                    WsServerMessage::ListDeleted { .. } => {
+                        leave_list("Esta lista foi excluída pelo dono.".to_string());
+                        break;
+                    }
+                    WsServerMessage::ResyncRequired { .. } => load_detail(),
                     _ => {}
                 }
             }
@@ -282,191 +291,201 @@ pub fn ListDetailView(
     let current_name_input = new_item_name.read().clone();
     let preview_category = CategoryId::detect_from_name(&current_name_input);
 
-    let handle_add_item = move |_| {
-        let name = new_item_name.read().trim().to_string();
-        let qty: f64 = new_item_qty.read().trim().replace(',', ".").parse().unwrap_or(1.0);
-        let unit = *new_item_unit.read();
-        let price_opt: Option<f64> = new_item_price.read().trim().replace(',', ".").parse().ok();
-        let client = api_client.read().clone();
+    // Apenas o dono pode excluir a lista
+    let is_owner = {
+        let my_id = current_user.read().as_ref().map(|u| u.id);
+        detail
+            .read()
+            .as_ref()
+            .zip(my_id)
+            .map(|(d, uid)| {
+                d.members
+                    .iter()
+                    .any(|m| m.user_id == uid && m.role == MemberRole::Owner)
+                    || d.list.created_by == uid
+            })
+            .unwrap_or(false)
+    };
 
+    let mut open_add_drawer = move || {
+        add_error.set(None);
+        show_add_drawer.set(true);
+    };
+
+    let mut handle_add_item = move || {
+        if *is_saving.peek() {
+            return;
+        }
+        let name = new_item_name.read().trim().to_string();
         if name.is_empty() {
-            error_msg.set(Some("Informe o nome do produto".to_string()));
+            add_error.set(Some("Informe o nome do produto".to_string()));
             return;
         }
 
+        let qty_text = new_item_qty.read().clone();
+        let qty = if qty_text.trim().is_empty() {
+            1.0
+        } else {
+            match parse_decimal(&qty_text) {
+                Some(q) if q > 0.0 => q,
+                _ => {
+                    add_error.set(Some("Quantidade inválida. Use um número, como 1 ou 0,5".to_string()));
+                    return;
+                }
+            }
+        };
+
+        let price_text = new_item_price.read().clone();
+        let price_opt = if price_text.trim().is_empty() {
+            None
+        } else {
+            match parse_decimal(&price_text) {
+                Some(p) if p >= 0.0 => Some(p),
+                _ => {
+                    add_error.set(Some("Preço inválido. Use um valor como 12,90".to_string()));
+                    return;
+                }
+            }
+        };
+
+        let unit = *new_item_unit.read();
+        let client = api_client.peek().clone();
+        is_saving.set(true);
+        add_error.set(None);
+
         spawn(async move {
             let req = CreateItemRequest {
-                name: name.clone(),
                 category_id: Some(CategoryId::detect_from_name(&name)),
+                name,
                 quantity: Some(qty),
                 unit: Some(unit),
                 estimated_price: price_opt,
                 notes: None,
             };
 
-            match client.add_item(list_id, req.clone()).await {
+            match client.add_item(list_id, req).await {
                 Ok(new_item) => {
                     new_item_name.set(String::new());
                     new_item_price.set(String::new());
                     new_item_qty.set("1".to_string());
                     show_add_drawer.set(false);
                     if let Some(d) = detail.write().as_mut() {
-                        if !d.items.iter().any(|i| i.id == new_item.id) {
-                            d.items.push(new_item);
-                        }
-                        recalculate_totals(d);
+                        upsert_item(d, new_item);
                     }
                 }
-                Err(_) => {
-                    // Fallback para modo demo / offline
-                    let fallback_item = Item {
-                        id: Uuid::new_v4(),
-                        list_id,
-                        category_id: req.category_id.unwrap_or(CategoryId::Grocery),
-                        name: req.name,
-                        quantity: req.quantity.unwrap_or(1.0),
-                        unit: req.unit.unwrap_or(QuantityUnit::Un),
-                        estimated_price: req.estimated_price,
-                        actual_price: None,
-                        purchased: false,
-                        purchased_by_user_id: None,
-                        purchased_by_user_name: None,
-                        added_by_user_id: Uuid::nil(),
-                        added_by_user_name: Some("Você (Demo)".to_string()),
-                        notes: req.notes,
-                        purchased_at: None,
-                        created_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
-                    };
-                    new_item_name.set(String::new());
-                    new_item_price.set(String::new());
-                    new_item_qty.set("1".to_string());
-                    show_add_drawer.set(false);
-                    if let Some(d) = detail.write().as_mut() {
-                        d.items.push(fallback_item);
-                        recalculate_totals(d);
-                    }
-                }
+                // Nada é adicionado localmente: o formulário continua preenchido para tentar de novo
+                Err(err) if err.is_unauthorized() => show_api_error(err, error_msg, session),
+                Err(err) => add_error.set(Some(err.message)),
             }
+            is_saving.set(false);
         });
     };
 
-    let handle_toggle_item = move |item_id: Uuid, current_purchased: bool, current_price: Option<f64>| {
-        let client = api_client.read().clone();
+    // Marca/desmarca com atualização imediata na tela, desfeita se o servidor recusar
+    let mut handle_toggle_item = move |item_id: Uuid, current_purchased: bool| {
+        let client = api_client.peek().clone();
+
+        let previous = detail
+            .peek()
+            .as_ref()
+            .and_then(|d| d.items.iter().find(|i| i.id == item_id).cloned());
+        let Some(previous) = previous else { return };
+
+        if let Some(d) = detail.write().as_mut() {
+            if let Some(target) = d.items.iter_mut().find(|i| i.id == item_id) {
+                target.purchased = !current_purchased;
+            }
+            normalize_detail(d);
+        }
+
         spawn(async move {
             let req = ToggleItemPurchasedRequest {
                 purchased: !current_purchased,
-                actual_price: current_price,
+                actual_price: None,
             };
 
             match client.toggle_item_purchased(list_id, item_id, req).await {
                 Ok(updated_item) => {
                     if let Some(d) = detail.write().as_mut() {
-                        if let Some(target) = d.items.iter_mut().find(|i| i.id == item_id) {
-                            *target = updated_item;
-                        }
-                        recalculate_totals(d);
+                        upsert_item(d, updated_item);
                     }
                 }
-                Err(_) => {
-                    // Fallback local se backend offline
+                Err(err) => {
                     if let Some(d) = detail.write().as_mut() {
-                        if let Some(target) = d.items.iter_mut().find(|i| i.id == item_id) {
-                            target.purchased = !current_purchased;
-                            target.actual_price = if target.purchased { current_price } else { None };
-                        }
-                        recalculate_totals(d);
+                        upsert_item(d, previous);
                     }
+                    show_api_error(err, error_msg, session);
                 }
             }
         });
     };
 
-    let handle_delete_item = move |item_id: Uuid| {
-        let client = api_client.read().clone();
-        spawn(async move {
-            let _ = client.delete_item(list_id, item_id).await;
-            if let Some(d) = detail.write().as_mut() {
-                d.items.retain(|i| i.id != item_id);
-                recalculate_totals(d);
+    // Remove da tela na hora; o servidor só é chamado depois do prazo para desfazer
+    let mut handle_delete_item = move |item_id: Uuid| {
+        let removed = detail
+            .peek()
+            .as_ref()
+            .and_then(|d| d.items.iter().find(|i| i.id == item_id).cloned());
+        let Some(removed) = removed else { return };
+
+        if let Some(d) = detail.write().as_mut() {
+            d.items.retain(|i| i.id != item_id);
+            normalize_detail(d);
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        undo_delete.set(Some((removed.clone(), cancelled.clone())));
+
+        let client = api_client.peek().clone();
+        // Continua mesmo se a pessoa sair da tela antes do prazo
+        let _ = spawn_forever(async move {
+            sleep_ms(UNDO_MS).await;
+            if cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+            // A tela pode ter sido fechada: só mexe nos sinais se ainda existirem
+            if let Ok(mut pending) = undo_delete.try_write() {
+                if pending.as_ref().map(|(i, _)| i.id) == Some(item_id) {
+                    *pending = None;
+                }
+            }
+            if let Err(err) = client.delete_item(list_id, item_id).await {
+                if err.status == Some(404) {
+                    return; // já tinha sido removido por outra pessoa
+                }
+                if let Ok(mut d) = detail.try_write() {
+                    if let Some(d) = d.as_mut() {
+                        upsert_item(d, removed);
+                    }
+                }
+                if let Ok(mut msg) = error_msg.try_write() {
+                    *msg = Some(err.message);
+                }
             }
         });
+    };
+
+    let mut handle_undo = move || {
+        if let Some((item, cancelled)) = undo_delete.take() {
+            cancelled.store(true, Ordering::SeqCst);
+            if let Some(d) = detail.write().as_mut() {
+                upsert_item(d, item);
+            }
+        }
     };
 
     let open_suggestions = move |_| {
-        let client = api_client.read().clone();
+        let client = api_client.peek().clone();
+        suggestions.set(Vec::new());
         loading_suggestions.set(true);
-        show_suggestions_modal.set(true);
+        show_suggestions.set(true);
 
         spawn(async move {
             match client.get_suggestions(list_id).await {
-                Ok(data) => {
-                    if data.is_empty() {
-                        suggestions.set(vec![
-                            FrequentItemResponse {
-                                name: "Pão de Alho".to_string(),
-                                category_id: CategoryId::Produce,
-                                purchase_count: 5,
-                                last_unit: QuantityUnit::Pct,
-                                last_price: Some(18.00),
-                            },
-                            FrequentItemResponse {
-                                name: "Carvão Vegetal".to_string(),
-                                category_id: CategoryId::Produce,
-                                purchase_count: 4,
-                                last_unit: QuantityUnit::Pct,
-                                last_price: Some(25.00),
-                            },
-                            FrequentItemResponse {
-                                name: "Queijo Coalho".to_string(),
-                                category_id: CategoryId::Dairy,
-                                purchase_count: 3,
-                                last_unit: QuantityUnit::Pct,
-                                last_price: Some(19.90),
-                            },
-                            FrequentItemResponse {
-                                name: "Sal Grosso".to_string(),
-                                category_id: CategoryId::Grocery,
-                                purchase_count: 3,
-                                last_unit: QuantityUnit::Kg,
-                                last_price: Some(6.50),
-                            },
-                        ]);
-                    } else {
-                        suggestions.set(data);
-                    }
-                }
-                Err(_) => {
-                    suggestions.set(vec![
-                        FrequentItemResponse {
-                            name: "Pão de Alho".to_string(),
-                            category_id: CategoryId::Produce,
-                            purchase_count: 5,
-                            last_unit: QuantityUnit::Pct,
-                            last_price: Some(18.00),
-                        },
-                        FrequentItemResponse {
-                            name: "Carvão Vegetal".to_string(),
-                            category_id: CategoryId::Produce,
-                            purchase_count: 4,
-                            last_unit: QuantityUnit::Pct,
-                            last_price: Some(25.00),
-                        },
-                        FrequentItemResponse {
-                            name: "Queijo Coalho".to_string(),
-                            category_id: CategoryId::Dairy,
-                            purchase_count: 3,
-                            last_unit: QuantityUnit::Pct,
-                            last_price: Some(19.90),
-                        },
-                        FrequentItemResponse {
-                            name: "Sal Grosso".to_string(),
-                            category_id: CategoryId::Grocery,
-                            purchase_count: 3,
-                            last_unit: QuantityUnit::Kg,
-                            last_price: Some(6.50),
-                        },
-                    ]);
+                Ok(data) => suggestions.set(data),
+                Err(err) => {
+                    show_suggestions.set(false);
+                    show_api_error(err, error_msg, session);
                 }
             }
             loading_suggestions.set(false);
@@ -474,10 +493,10 @@ pub fn ListDetailView(
     };
 
     let add_suggested_item = move |item_name: String, cat: CategoryId, unit: QuantityUnit, price: Option<f64>| {
-        let client = api_client.read().clone();
+        let client = api_client.peek().clone();
         spawn(async move {
             let req = CreateItemRequest {
-                name: item_name,
+                name: item_name.clone(),
                 category_id: Some(cat),
                 quantity: Some(1.0),
                 unit: Some(unit),
@@ -485,72 +504,87 @@ pub fn ListDetailView(
                 notes: None,
             };
 
-            if let Ok(new_item) = client.add_item(list_id, req).await {
-                if let Some(d) = detail.write().as_mut() {
-                    if !d.items.iter().any(|i| i.id == new_item.id) {
-                        d.items.push(new_item);
+            match client.add_item(list_id, req).await {
+                Ok(new_item) => {
+                    show_toast(format!("{} adicionado", item_name));
+                    if let Some(d) = detail.write().as_mut() {
+                        upsert_item(d, new_item);
                     }
-                    recalculate_totals(d);
                 }
+                Err(err) => show_api_error(err, error_msg, session),
+            }
+        });
+    };
+
+    let handle_delete_list = move |_| {
+        let client = api_client.peek().clone();
+        show_delete_modal.set(false);
+        spawn(async move {
+            match client.delete_list(list_id).await {
+                Ok(_) => {
+                    success_msg.set(Some("Lista excluída".to_string()));
+                    active_list_id.set(None);
+                }
+                Err(err) => show_api_error(err, error_msg, session),
             }
         });
     };
 
     rsx! {
-        div { class: "main-content",
-            // Barra Superior de Navegação
-            div { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; gap: 8px;",
+        div { class: "main-content has-pill",
+            // Barra superior: voltar, sugestões e código de convite
+            div { class: "list-toolbar",
                 button {
-                    class: "btn btn-secondary",
-                    style: "padding: 6px 14px; font-size: 0.85rem;",
+                    class: "btn btn-secondary btn-sm",
                     onclick: move |_| active_list_id.set(None),
-                    "← Listas"
+                    Icon { kind: IconKind::ChevronLeft, size: 18 }
+                    "Listas"
                 }
 
-                div { style: "display: flex; align-items: center; gap: 8px;",
+                div { class: "toolbar-actions",
                     button {
-                        class: "btn btn-secondary",
-                        style: "padding: 6px 12px; font-size: 0.82rem;",
+                        class: "btn btn-secondary btn-sm",
                         onclick: open_suggestions,
                         "Sugeridos"
                     }
                     if let Some(d) = detail.read().as_ref() {
-                        span {
-                            class: "badge badge-code",
-                            title: "Código da Lista",
-                            "{d.list.invite_code}"
+                        {
+                            let code = d.list.invite_code.clone();
+                            rsx! {
+                                button {
+                                    class: "btn btn-secondary btn-sm btn-code",
+                                    "aria-label": "Copiar código de convite {code}",
+                                    onclick: move |_| {
+                                        copy_to_clipboard(&code);
+                                        show_toast(format!("Código {} copiado. Envie para quem vai comprar junto.", code));
+                                    },
+                                    Icon { kind: IconKind::Copy, size: 16 }
+                                    "{d.list.invite_code}"
+                                }
+                            }
                         }
-                        button {
-                            class: "btn btn-secondary",
-                            style: "padding: 6px 10px; font-size: 0.82rem; color: #ef4444; border-color: rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.05);",
-                            title: "Excluir Lista",
-                            onclick: move |_| show_delete_modal.set(true),
-                            "🗑️"
-                        }
-                    }
-                }
-            }
-
-            // Notificações em Tempo Real (WebSocket)
-            if let Some(msg) = real_time_alert.read().as_ref() {
-                div { class: "alert alert-success",
-                    span { "{msg}" }
-                    span {
-                        style: "cursor: pointer; font-weight: bold; margin-left: 12px;",
-                        onclick: move |_| real_time_alert.set(None),
-                        "✕"
                     }
                 }
             }
 
             if let Some(err) = error_msg.read().as_ref() {
-                div { class: "alert alert-error", "{err}" }
+                div { class: "alert alert-error", role: "alert",
+                    span { "{err}" }
+                    button {
+                        class: "icon-btn",
+                        "aria-label": "Fechar aviso",
+                        onclick: move |_| error_msg.set(None),
+                        Icon { kind: IconKind::X, size: 18 }
+                    }
+                }
             }
 
             if let Some(d) = detail.read().as_ref() {
                 {
                     let pending_items: Vec<Item> = d.items.iter().filter(|i| !i.purchased).cloned().collect();
                     let purchased_items: Vec<Item> = d.items.iter().filter(|i| i.purchased).cloned().collect();
+                    // Em lista de uma pessoa só, "por Fulano" é ruído
+                    let shared_list = d.members.len() > 1;
 
                     let progress_pct = if d.totals.total_items > 0 {
                         (d.totals.purchased_items as f64 / d.totals.total_items as f64) * 100.0
@@ -559,124 +593,147 @@ pub fn ListDetailView(
                     };
 
                     rsx! {
-                        // Cabeçalho Editorial Minimalista (Things 3)
-                        div { style: "margin-top: 8px; margin-bottom: 20px;",
-                            h1 { style: "font-size: 1.7rem; font-weight: 800; letter-spacing: -0.025em; color: var(--text-primary); margin-bottom: 4px;", "{d.list.name}" }
+                        div { class: "list-header",
+                            h1 { class: "list-title", "{d.list.name}" }
                             if let Some(desc) = &d.list.description {
-                                p { style: "color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;", "{desc}" }
+                                p { class: "list-desc", "{desc}" }
                             }
-
-                            // Barra de Progresso Discreta (4px)
-                            div { style: "display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px; margin-top: 10px;",
-                                span { "{d.totals.purchased_items} de {d.totals.total_items} no carrinho" }
-                                span { style: "font-weight: 600; color: var(--text-primary);", "{progress_pct:.0}%" }
-                            }
-                            div { style: "width: 100%; height: 4px; background: #e2e8f0; border-radius: 2px; overflow: hidden;",
-                                div { style: "width: {progress_pct:.0}%; height: 100%; background: var(--carbon-dark); border-radius: 2px; transition: width 0.25s ease;" }
+                            if d.totals.total_items > 0 {
+                                div { class: "list-progress-label",
+                                    span { "{d.totals.purchased_items} de {d.totals.total_items} no carrinho" }
+                                }
+                                div {
+                                    class: "progress",
+                                    role: "progressbar",
+                                    "aria-valuemin": "0",
+                                    "aria-valuemax": "{d.totals.total_items}",
+                                    "aria-valuenow": "{d.totals.purchased_items}",
+                                    "aria-label": "Itens no carrinho",
+                                    div { class: "progress-fill", style: "width: {progress_pct:.0}%;" }
+                                }
                             }
                         }
 
-                        // Seção de Itens da Lista (Agrupados por Categoria em Inset-Groups)
                         if pending_items.is_empty() && purchased_items.is_empty() {
-                            div { style: "text-align: center; padding: 60px 20px; color: var(--text-muted);",
-                                p { style: "font-size: 1.05rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px;", "Sua lista está vazia" }
-                                p { style: "font-size: 0.85rem;", "Toque no botão '+' abaixo para adicionar produtos." }
+                            div { class: "empty-state",
+                                h2 { "Lista vazia" }
+                                p { "Toque no + lá embaixo para adicionar o primeiro produto." }
                             }
                         } else {
-                            // Categorias com produtos pendentes
+                            // Pendentes, agrupados por corredor
                             for cat in CategoryId::all().iter().filter(|c| pending_items.iter().any(|i| i.category_id == **c)) {
-                                div { key: "{cat.as_str()}", class: "inset-group",
-                                    // Cabeçalho da Seção de Mercado
+                                section { key: "{cat.as_str()}", class: "inset-group", "aria-label": "{cat.display_name()}",
                                     div { class: "aisle-header",
                                         span { class: "aisle-dot", style: "background-color: {cat.color_hex()};" }
                                         span { "{cat.display_name()}" }
                                     }
 
-                                    // Linhas de itens
                                     for item in pending_items.iter().filter(|i| i.category_id == *cat) {
-                                        div { key: "{item.id}", class: "minimal-item-row",
-                                            input {
-                                                class: "minimal-checkbox",
-                                                r#type: "checkbox",
-                                                checked: false,
-                                                onchange: {
-                                                    let item_id = item.id;
-                                                    let price = item.actual_price.or(item.estimated_price);
-                                                    move |_| handle_toggle_item(item_id, false, price)
-                                                }
-                                            }
+                                        {
+                                            let item_id = item.id;
+                                            rsx! {
+                                                div {
+                                                    key: "{item.id}",
+                                                    class: "minimal-item-row",
+                                                    role: "checkbox",
+                                                    "aria-checked": "false",
+                                                    tabindex: "0",
+                                                    onclick: move |_| handle_toggle_item(item_id, false),
+                                                    onkeydown: move |e: KeyboardEvent| {
+                                                        if e.key() == Key::Enter || e.key() == Key::Character(" ".into()) {
+                                                            e.prevent_default();
+                                                            handle_toggle_item(item_id, false);
+                                                        }
+                                                    },
 
-                                            div { class: "item-info",
-                                                div { class: "item-name", "{item.name}" }
-                                                div { class: "item-meta",
-                                                    span { class: "item-qty-tag", "{item.quantity} {item.unit.as_str()}" }
-                                                    if let Some(adder) = &item.added_by_user_name {
-                                                        span { "por {adder}" }
-                                                    }
-                                                }
-                                            }
+                                                    span { class: "check-circle", "aria-hidden": "true" }
 
-                                            if let Some(p) = item.actual_price.or(item.estimated_price) {
-                                                div { class: "item-price", "R$ {p:.2}" }
-                                            }
-
-                                            button {
-                                                class: "item-delete-btn",
-                                                title: "Remover",
-                                                onclick: {
-                                                    let item_id = item.id;
-                                                    move |_| handle_delete_item(item_id)
-                                                },
-                                                "✕"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Itens Concluídos (No Carrinho)
-                            if !purchased_items.is_empty() {
-                                div { style: "margin-top: 20px;",
-                                    div { style: "font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; padding-left: 4px;",
-                                        "CONCLUÍDOS ({purchased_items.len()})"
-                                    }
-
-                                    div { class: "inset-group",
-                                        for item in purchased_items.iter() {
-                                            div { key: "{item.id}", class: "minimal-item-row is-purchased",
-                                                input {
-                                                    class: "minimal-checkbox",
-                                                    r#type: "checkbox",
-                                                    checked: true,
-                                                    onchange: {
-                                                        let item_id = item.id;
-                                                        let price = item.actual_price.or(item.estimated_price);
-                                                        move |_| handle_toggle_item(item_id, true, price)
-                                                    }
-                                                }
-
-                                                div { class: "item-info",
-                                                    div { class: "item-name", "{item.name}" }
-                                                    div { class: "item-meta",
-                                                        span { class: "item-qty-tag", "{item.quantity} {item.unit.as_str()}" }
-                                                        if let Some(buyer) = &item.purchased_by_user_name {
-                                                            span { "marcado por {buyer}" }
+                                                    div { class: "item-info",
+                                                        div { class: "item-name", "{item.name}" }
+                                                        div { class: "item-meta",
+                                                            span { class: "item-qty-tag", "{fmt_qty(item.quantity)} {item.unit.as_str()}" }
+                                                            if shared_list {
+                                                                if let Some(adder) = &item.added_by_user_name {
+                                                                    span { "por {adder}" }
+                                                                }
+                                                            }
                                                         }
                                                     }
-                                                }
 
-                                                if let Some(p) = item.actual_price.or(item.estimated_price) {
-                                                    div { class: "item-price", "R$ {p:.2}" }
-                                                }
+                                                    if let Some(p) = item.actual_price.or(item.estimated_price) {
+                                                        div { class: "item-price", "{brl(p)}" }
+                                                    }
 
-                                                button {
-                                                    class: "item-delete-btn",
-                                                    title: "Remover",
-                                                    onclick: {
-                                                        let item_id = item.id;
-                                                        move |_| handle_delete_item(item_id)
+                                                    button {
+                                                        class: "item-delete-btn",
+                                                        "aria-label": "Remover {item.name}",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            handle_delete_item(item_id);
+                                                        },
+                                                        onkeydown: move |e: KeyboardEvent| e.stop_propagation(),
+                                                        Icon { kind: IconKind::X, size: 18 }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // No carrinho
+                            if !purchased_items.is_empty() {
+                                h2 { class: "section-label", "No carrinho ({purchased_items.len()})" }
+
+                                section { class: "inset-group", "aria-label": "No carrinho",
+                                    for item in purchased_items.iter() {
+                                        {
+                                            let item_id = item.id;
+                                            rsx! {
+                                                div {
+                                                    key: "{item.id}",
+                                                    class: "minimal-item-row is-purchased",
+                                                    role: "checkbox",
+                                                    "aria-checked": "true",
+                                                    tabindex: "0",
+                                                    onclick: move |_| handle_toggle_item(item_id, true),
+                                                    onkeydown: move |e: KeyboardEvent| {
+                                                        if e.key() == Key::Enter || e.key() == Key::Character(" ".into()) {
+                                                            e.prevent_default();
+                                                            handle_toggle_item(item_id, true);
+                                                        }
                                                     },
-                                                    "✕"
+
+                                                    span { class: "check-circle checked", "aria-hidden": "true",
+                                                        Icon { kind: IconKind::Check, size: 14, stroke: 3.0 }
+                                                    }
+
+                                                    div { class: "item-info",
+                                                        div { class: "item-name", "{item.name}" }
+                                                        div { class: "item-meta",
+                                                            span { class: "item-qty-tag", "{fmt_qty(item.quantity)} {item.unit.as_str()}" }
+                                                            if shared_list {
+                                                                if let Some(buyer) = &item.purchased_by_user_name {
+                                                                    span { "pego por {buyer}" }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+
+                                                    if let Some(p) = item.actual_price.or(item.estimated_price) {
+                                                        div { class: "item-price", "{brl(p)}" }
+                                                    }
+
+                                                    button {
+                                                        class: "item-delete-btn",
+                                                        "aria-label": "Remover {item.name}",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            handle_delete_item(item_id);
+                                                        },
+                                                        onkeydown: move |e: KeyboardEvent| e.stop_propagation(),
+                                                        Icon { kind: IconKind::X, size: 18 }
+                                                    }
                                                 }
                                             }
                                         }
@@ -685,177 +742,276 @@ pub fn ListDetailView(
                             }
                         }
 
-                        div { style: "margin-top: 48px; margin-bottom: 80px; text-align: center;",
-                            button {
-                                class: "btn btn-secondary",
-                                style: "color: #ef4444; border-color: rgba(239, 68, 68, 0.25); background: transparent; font-size: 0.85rem; padding: 10px 20px;",
-                                onclick: move |_| show_delete_modal.set(true),
-                                "🗑️ Excluir esta lista permanentemente"
+                        // Excluir a lista: um único lugar, discreto, no fim
+                        if is_owner {
+                            div { class: "danger-zone",
+                                button {
+                                    class: "btn btn-danger-text btn-sm",
+                                    onclick: move |_| show_delete_modal.set(true),
+                                    Icon { kind: IconKind::Trash, size: 16 }
+                                    "Excluir lista"
+                                }
                             }
                         }
 
-                        // Barra Flutuante de Resumo e Ação (A exata pílula da sua imagem anexada!)
+                        // Pílula fixa: progresso, total no carrinho e adicionar
                         div { class: "floating-summary-pill",
-                            div { class: "floating-summary-text",
-                                span { "{d.totals.total_items} itens" }
-                                span { "•" }
-                                span { "Total: " }
-                                strong { "R$ {d.totals.total_planned:.2}" }
+                            div { class: "pill-summary", "aria-live": "polite",
+                                span { class: "pill-count", "{d.totals.purchased_items}/{d.totals.total_items}" }
+                                div { class: "pill-totals",
+                                    strong { "{brl(d.totals.total_cart)}" }
+                                    span { class: "pill-sub", "no carrinho · de {brl(d.totals.total_planned)}" }
+                                }
                             }
                             button {
                                 class: "floating-add-btn",
-                                title: "Adicionar produto",
-                                onclick: move |_| show_add_drawer.set(true),
-                                "+"
-                            }
-                        }
-
-                        // Bottom Sheet / Gaveta para Adicionar Item
-                        if *show_add_drawer.read() {
-                            div {
-                                class: "drawer-overlay",
-                                onclick: move |_| show_add_drawer.set(false),
-                                div {
-                                    class: "drawer-content",
-                                    onclick: move |e| e.stop_propagation(),
-
-                                    div { class: "drawer-handle" }
-
-                                    div { style: "display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;",
-                                        h3 { style: "font-size: 1.15rem; font-weight: 700; color: var(--text-primary);", "Adicionar à Lista" }
-                                        button {
-                                            class: "btn-ghost",
-                                            onclick: move |_| show_add_drawer.set(false),
-                                            "✕"
-                                        }
-                                    }
-
-                                    div { class: "form-group",
-                                        input {
-                                            class: "form-input",
-                                            placeholder: "Nome do produto (ex: Leite, Maçã gala, Picanha...)",
-                                            value: "{new_item_name}",
-                                            oninput: move |e| new_item_name.set(e.value())
-                                        }
-                                    }
-
-                                    // Preview em tempo real da categoria
-                                    if !new_item_name.read().trim().is_empty() {
-                                        div { style: "display: flex; align-items: center; gap: 6px; margin-bottom: 14px; font-size: 0.82rem;",
-                                            span { style: "color: var(--text-secondary);", "Corredor sugerido:" }
-                                            span {
-                                                class: "badge",
-                                                style: "background-color: {preview_category.color_hex()}; color: #ffffff;",
-                                                "{preview_category.display_name()}"
-                                            }
-                                        }
-                                    }
-
-                                    div { style: "display: flex; gap: 8px; margin-bottom: 20px;",
-                                        div { style: "flex: 1;",
-                                            input {
-                                                class: "form-input",
-                                                r#type: "number",
-                                                placeholder: "Qtd",
-                                                value: "{new_item_qty}",
-                                                oninput: move |e| new_item_qty.set(e.value())
-                                            }
-                                        }
-                                        div { style: "flex: 1.2;",
-                                            select {
-                                                class: "form-input",
-                                                onchange: move |e| {
-                                                    new_item_unit.set(QuantityUnit::from_unit_str(&e.value()));
-                                                },
-                                                option { value: "un", "un" }
-                                                option { value: "kg", "kg" }
-                                                option { value: "g", "g" }
-                                                option { value: "l", "l" }
-                                                option { value: "pct", "pct" }
-                                                option { value: "cx", "cx" }
-                                                option { value: "dz", "dz" }
-                                            }
-                                        }
-                                        div { style: "flex: 1.5;",
-                                            input {
-                                                class: "form-input",
-                                                placeholder: "R$ Estimado",
-                                                value: "{new_item_price}",
-                                                oninput: move |e| new_item_price.set(e.value())
-                                            }
-                                        }
-                                    }
-
-                                    button {
-                                        class: "btn btn-primary",
-                                        style: "width: 100%; padding: 12px; font-size: 0.95rem;",
-                                        onclick: handle_add_item,
-                                        "Adicionar Produto"
-                                    }
-                                }
+                                "aria-label": "Adicionar produto",
+                                onclick: move |_| open_add_drawer(),
+                                Icon { kind: IconKind::Plus, size: 24 }
                             }
                         }
                     }
                 }
             } else if *is_loading.read() {
-                div { style: "text-align: center; padding: 60px; color: var(--text-muted);", "Carregando itens..." }
+                div { class: "loading-state", "Carregando itens..." }
+            } else if *load_failed.read() {
+                div { class: "empty-state",
+                    p { style: "margin-bottom: 16px;", "Não foi possível carregar a lista." }
+                    button {
+                        class: "btn btn-primary",
+                        onclick: move |_| load_detail(),
+                        "Tentar novamente"
+                    }
+                }
             }
 
-            // Modal: Mais Comprados / Sugestões Inteligentes
-            if *show_suggestions_modal.read() {
-                div { class: "modal-overlay",
-                    div { class: "modal-content", style: "max-height: 80vh; overflow-y: auto;",
-                        div { style: "display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;",
-                            h3 { style: "font-size: 1.25rem;", "✨ Itens Mais Comprados" }
+            // Avisos temporários (não empurram a lista)
+            div { class: "toast-stack", "aria-live": "polite",
+                if let Some(msg) = toast.read().as_ref() {
+                    div { class: "toast", role: "status",
+                        span { class: "toast-text", "{msg}" }
+                    }
+                }
+                if let Some((item, _)) = undo_delete.read().as_ref() {
+                    div { class: "toast", role: "status",
+                        span { class: "toast-text", "{item.name} removido" }
+                        button {
+                            class: "toast-action",
+                            onclick: move |_| handle_undo(),
+                            "Desfazer"
+                        }
+                    }
+                }
+            }
+
+            // Gaveta: adicionar produto
+            if *show_add_drawer.read() {
+                div {
+                    class: "drawer-overlay",
+                    onclick: move |_| show_add_drawer.set(false),
+                    div {
+                        class: "drawer-content",
+                        role: "dialog",
+                        "aria-modal": "true",
+                        "aria-labelledby": "add-title",
+                        onclick: move |e| e.stop_propagation(),
+
+                        div { class: "drawer-handle" }
+
+                        div { class: "sheet-header",
+                            h2 { id: "add-title", class: "sheet-title", "Adicionar produto" }
                             button {
-                                class: "btn-icon",
-                                style: "color: #64748b; font-size: 1.2rem;",
-                                onclick: move |_| show_suggestions_modal.set(false),
-                                "✕"
+                                class: "icon-btn",
+                                "aria-label": "Fechar",
+                                onclick: move |_| show_add_drawer.set(false),
+                                Icon { kind: IconKind::X, size: 20 }
                             }
                         }
 
-                        if *loading_suggestions.read() {
-                            p { style: "color: #64748b; text-align: center; padding: 20px;", "Carregando histórico de compras..." }
-                        } else if suggestions.read().is_empty() {
-                            p { style: "color: #64748b; text-align: center; padding: 20px;",
-                                "Nenhum histórico registrado ainda. Marque itens como comprados para gerar sugestões automáticas!"
+                        // Enter em qualquer campo adiciona
+                        form {
+                            onsubmit: move |e: FormEvent| {
+                                e.prevent_default();
+                                handle_add_item();
+                            },
+
+                            div { class: "form-group",
+                                label { class: "visually-hidden", r#for: "new-item-name", "Nome do produto" }
+                                input {
+                                    id: "new-item-name",
+                                    class: "form-input",
+                                    autofocus: true,
+                                    autocomplete: "off",
+                                    enterkeyhint: "done",
+                                    placeholder: "Nome do produto (ex: leite, maçã, picanha)",
+                                    value: "{new_item_name}",
+                                    oninput: move |e| new_item_name.set(e.value())
+                                }
                             }
-                        } else {
-                            p { style: "font-size: 0.85rem; color: #64748b; margin-bottom: 12px;",
-                                "Toque em qualquer item para adicionar rapidamente à sua lista:"
+
+                            // Prévia da categoria (fundo claro da cor do corredor, texto escuro)
+                            if !new_item_name.read().trim().is_empty() {
+                                div { class: "category-preview",
+                                    span { "Corredor:" }
+                                    span {
+                                        class: "category-chip",
+                                        style: "background-color: {preview_category.color_hex()}26;",
+                                        span { class: "aisle-dot", style: "background-color: {preview_category.color_hex()};" }
+                                        "{preview_category.display_name()}"
+                                    }
+                                }
                             }
 
-                            for item in suggestions.read().iter() {
-                                {
-                                    let name = item.name.clone();
-                                    let cat = item.category_id;
-                                    let unit = item.last_unit;
-                                    let price = item.last_price;
+                            div { class: "form-row",
+                                div { style: "flex: 1;",
+                                    label { class: "form-label", r#for: "new-item-qty", "Qtd" }
+                                    input {
+                                        id: "new-item-qty",
+                                        class: "form-input",
+                                        r#type: "text",
+                                        inputmode: "decimal",
+                                        value: "{new_item_qty}",
+                                        oninput: move |e| new_item_qty.set(e.value())
+                                    }
+                                }
+                                div { style: "flex: 1.1;",
+                                    label { class: "form-label", r#for: "new-item-unit", "Unidade" }
+                                    select {
+                                        id: "new-item-unit",
+                                        class: "form-input",
+                                        onchange: move |e| {
+                                            new_item_unit.set(QuantityUnit::from_unit_str(&e.value()));
+                                        },
+                                        option { value: "un", "un" }
+                                        option { value: "kg", "kg" }
+                                        option { value: "g", "g" }
+                                        option { value: "l", "l" }
+                                        option { value: "ml", "ml" }
+                                        option { value: "pct", "pct" }
+                                        option { value: "cx", "cx" }
+                                        option { value: "dz", "dz" }
+                                    }
+                                }
+                                div { style: "flex: 1.5;",
+                                    label { class: "form-label", r#for: "new-item-price", "Preço (R$)" }
+                                    input {
+                                        id: "new-item-price",
+                                        class: "form-input",
+                                        inputmode: "decimal",
+                                        placeholder: "Opcional",
+                                        value: "{new_item_price}",
+                                        oninput: move |e| new_item_price.set(e.value())
+                                    }
+                                }
+                            }
 
-                                    rsx! {
-                                        div {
-                                            key: "{item.name}",
-                                            class: "item-card",
-                                            style: "padding: 10px 14px; margin-bottom: 8px; justify-content: space-between;",
+                            if let Some(err) = add_error.read().as_ref() {
+                                p { class: "form-error", role: "alert", "{err}" }
+                            }
 
-                                            div {
-                                                div { style: "font-weight: 600; text-transform: capitalize;", "{item.name}" }
-                                                div { style: "font-size: 0.8rem; color: #64748b; display: flex; gap: 8px; margin-top: 2px;",
-                                                    span { "🔁 Comprado {item.purchase_count}x" }
-                                                    if let Some(p) = item.last_price {
-                                                        span { "• Último: R$ {p:.2}" }
+                            button {
+                                class: "btn btn-primary btn-block",
+                                r#type: "submit",
+                                disabled: *is_saving.read(),
+                                if *is_saving.read() { "Adicionando..." } else { "Adicionar" }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Gaveta: sugestões (itens mais comprados nesta lista)
+            if *show_suggestions.read() {
+                div {
+                    class: "drawer-overlay",
+                    onclick: move |_| show_suggestions.set(false),
+                    div {
+                        class: "drawer-content",
+                        role: "dialog",
+                        "aria-modal": "true",
+                        "aria-labelledby": "suggest-title",
+                        onclick: move |e| e.stop_propagation(),
+
+                        div { class: "drawer-handle" }
+
+                        div { class: "sheet-header",
+                            h2 { id: "suggest-title", class: "sheet-title", "Sugeridos" }
+                            button {
+                                class: "icon-btn",
+                                "aria-label": "Fechar",
+                                onclick: move |_| show_suggestions.set(false),
+                                Icon { kind: IconKind::X, size: 20 }
+                            }
+                        }
+
+                        {
+                            // Não sugere o que já está pendente na lista
+                            let pending_names: Vec<String> = detail
+                                .read()
+                                .as_ref()
+                                .map(|d| {
+                                    d.items
+                                        .iter()
+                                        .filter(|i| !i.purchased)
+                                        .map(|i| i.name.trim().to_lowercase())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let visible: Vec<FrequentItemResponse> = suggestions
+                                .read()
+                                .iter()
+                                .filter(|s| !pending_names.contains(&s.name.trim().to_lowercase()))
+                                .cloned()
+                                .collect();
+
+                            rsx! {
+                                if *loading_suggestions.read() {
+                                    p { class: "loading-state", "Carregando..." }
+                                } else if visible.is_empty() {
+                                    p { class: "sheet-hint",
+                                        if suggestions.read().is_empty() {
+                                            "Ainda não há histórico. Os produtos que vocês marcam no carrinho aparecem aqui nas próximas compras."
+                                        } else {
+                                            "Tudo o que vocês costumam comprar já está na lista."
+                                        }
+                                    }
+                                } else {
+                                    p { class: "sheet-hint", "O que vocês mais compram nesta lista:" }
+                                    div { class: "suggestion-list",
+                                        for item in visible.into_iter() {
+                                            {
+                                                let name = item.name.clone();
+                                                let cat = item.category_id;
+                                                let unit = item.last_unit;
+                                                let price = item.last_price;
+                                                let times = if item.purchase_count == 1 {
+                                                    "1 vez".to_string()
+                                                } else {
+                                                    format!("{} vezes", item.purchase_count)
+                                                };
+
+                                                rsx! {
+                                                    div { key: "{item.name}", class: "item-card",
+                                                        div { style: "min-width: 0;",
+                                                            div { class: "item-card-name", "{item.name}" }
+                                                            div { class: "item-card-meta",
+                                                                "Comprado {times}"
+                                                                if let Some(p) = item.last_price {
+                                                                    " · último {brl(p)}"
+                                                                }
+                                                            }
+                                                        }
+                                                        button {
+                                                            class: "btn btn-secondary btn-sm",
+                                                            "aria-label": "Adicionar {item.name}",
+                                                            onclick: move |_| {
+                                                                add_suggested_item(name.clone(), cat, unit, price);
+                                                            },
+                                                            Icon { kind: IconKind::Plus, size: 16 }
+                                                            "Adicionar"
+                                                        }
                                                     }
                                                 }
-                                            }
-
-                                            button {
-                                                class: "btn btn-primary",
-                                                style: "padding: 6px 12px; font-size: 0.85rem; min-height: 36px;",
-                                                onclick: move |_| {
-                                                    add_suggested_item(name.clone(), cat, unit, price);
-                                                },
-                                                "➕ Adicionar"
                                             }
                                         }
                                     }
@@ -866,45 +1022,31 @@ pub fn ListDetailView(
                 }
             }
 
-            // Modal: Confirmação de Exclusão de Lista
+            // Modal: confirmação de exclusão da lista
             if *show_delete_modal.read() {
                 if let Some(d) = detail.read().as_ref() {
                     div { class: "modal-overlay",
-                        div { class: "card",
-                            style: "max-width: 380px; width: 100%; border-radius: 20px; padding: 24px; box-shadow: 0 20px 40px rgba(0,0,0,0.25); border: 1px solid var(--border-light); background: var(--bg-card);",
-                            h3 { style: "color: #ef4444; font-size: 1.2rem; font-weight: 700; margin-bottom: 8px;", "Excluir Lista?" }
-                            p { style: "color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 24px; line-height: 1.45;",
-                                "Tem certeza que deseja excluir permanentemente a lista "
-                                strong { style: "color: var(--text-primary);", "\"{d.list.name}\"" }
-                                "? Todos os itens associados serão removidos e essa ação não pode ser desfeita."
+                        div {
+                            class: "modal-content",
+                            role: "alertdialog",
+                            "aria-modal": "true",
+                            "aria-labelledby": "delete-title",
+                            style: "max-width: 380px;",
+                            h2 { id: "delete-title", class: "modal-title", "Excluir esta lista?" }
+                            p { class: "modal-text",
+                                strong { "{d.list.name}" }
+                                " e todos os itens serão apagados para todos os participantes. Não dá para desfazer."
                             }
-                                div { style: "display: flex; justify-content: flex-end; gap: 10px;",
-                                    button {
-                                        class: "btn btn-secondary",
-                                        style: "padding: 8px 18px;",
-                                        onclick: move |_| show_delete_modal.set(false),
-                                        "Cancelar"
-                                    }
-                                    button {
-                                        class: "btn",
-                                        style: "background: #ef4444; color: #ffffff; border: none; padding: 8px 18px; font-weight: 700; border-radius: 9999px; cursor: pointer; box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);",
-                                        onclick: move |_| {
-                                            let client = api_client.read().clone();
-                                            show_delete_modal.set(false);
-                                            spawn(async move {
-                                                match client.delete_list(list_id).await {
-                                                    Ok(_) => {
-                                                        success_msg.set(Some("Lista excluída com sucesso!".to_string()));
-                                                        active_list_id.set(None);
-                                                    }
-                                                    Err(err) => {
-                                                        error_msg.set(Some(err));
-                                                    }
-                                                }
-                                            });
-                                        },
-                                        "Sim, Excluir"
-                                    }
+                            div { class: "modal-actions",
+                                button {
+                                    class: "btn btn-secondary",
+                                    onclick: move |_| show_delete_modal.set(false),
+                                    "Cancelar"
+                                }
+                                button {
+                                    class: "btn btn-danger",
+                                    onclick: handle_delete_list,
+                                    "Excluir"
                                 }
                             }
                         }
@@ -913,3 +1055,4 @@ pub fn ListDetailView(
             }
         }
     }
+}

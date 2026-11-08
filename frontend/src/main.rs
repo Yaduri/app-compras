@@ -1,13 +1,19 @@
 pub mod api;
+pub mod format;
+pub mod icons;
+pub mod session;
 pub mod storage;
 pub mod styles;
 pub mod views;
 pub mod ws_client;
 
 use dioxus::prelude::*;
+use shared::dto::UserProfile;
 use uuid::Uuid;
 
 use crate::api::ApiClient;
+use crate::icons::{Icon, IconKind};
+use crate::session::{BackStack, Layer, LiveStatus, SessionExpired};
 use crate::styles::APP_CSS;
 use crate::views::{AuthView, DashboardView, ListDetailView};
 
@@ -47,6 +53,24 @@ fn main() {
     }
 }
 
+/// Aceita apenas tokens com formato de JWT (base64url separado por pontos)
+fn is_plausible_token(token: &str) -> bool {
+    (20..=8192).contains(&token.len())
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Extrai o access_token de um fragmento como "#access_token=...&expires_in=..."
+fn extract_access_token(fragment: &str) -> Option<String> {
+    fragment
+        .trim_start_matches(['#', '?'])
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("access_token="))
+        .filter(|t| is_plausible_token(t))
+        .map(str::to_string)
+}
+
 #[component]
 fn App() -> Element {
     let initial_session = crate::storage::load_session_fs();
@@ -60,7 +84,12 @@ fn App() -> Element {
     let mut error_msg = use_signal(|| None::<String>);
     let success_msg = use_signal(|| None::<String>);
 
-    let handle_logout = move |_| {
+    let session_expired = use_context_provider(|| SessionExpired(Signal::new(false)));
+    let live_status = use_context_provider(|| LiveStatus(Signal::new(false)));
+    let back = use_context_provider(BackStack::new);
+
+    let mut do_logout = move || {
+        back.reset();
         current_user.set(None);
         auth_token.set(None);
         active_list_id.set(None);
@@ -68,9 +97,72 @@ fn App() -> Element {
         crate::storage::clear_session();
     };
 
-    // Restaura sessão salva no localStorage caso o sistema de arquivos ainda não tenha restaurado
+    let handle_logout = move |_| do_logout();
+
+    let mut login_with = move |token: String, user: UserProfile| {
+        crate::storage::save_session(&token, &user);
+        let base_url = api_client.peek().base_url.clone();
+        auth_token.set(Some(token.clone()));
+        current_user.set(Some(user));
+        api_client.set(ApiClient::new(Some(base_url), Some(token)));
+    };
+
+    // Qualquer tela que receber 401 dispara o logout por aqui
     use_effect(move || {
-        let client = api_client.read().clone();
+        let mut expired = session_expired.0;
+        if *expired.read() {
+            expired.set(false);
+            if current_user.peek().is_some() {
+                do_logout();
+                error_msg.set(Some("Sua sessão expirou. Entre novamente.".to_string()));
+            }
+        }
+    });
+
+    // Botão/gesto "voltar" do Android: cada `popstate` fecha a camada do topo
+    use_hook(move || {
+        spawn(async move {
+            let mut eval = document::eval(
+                r#"
+                window.addEventListener("popstate", function () { dioxus.send(true); });
+                "#,
+            );
+            while eval.recv::<bool>().await.is_ok() {
+                back.on_back();
+            }
+        });
+    });
+
+    // Lista aberta é uma camada: o "voltar" retorna ao painel
+    use_effect(move || {
+        if active_list_id.read().is_some() {
+            back.open(Layer::List);
+        } else {
+            back.close(Layer::List);
+        }
+    });
+    use_effect(move || {
+        if let Some((Layer::List, _)) = *back.closed.read() {
+            active_list_id.set(None);
+        }
+    });
+
+    // Valida a sessão salva no arquivo assim que o app abre
+    use_hook(move || {
+        let client = api_client.peek().clone();
+        if client.token.is_some() {
+            spawn(async move {
+                if let Err(err) = client.get_me().await {
+                    if err.is_unauthorized() {
+                        do_logout();
+                    }
+                }
+            });
+        }
+    });
+
+    // Restaura a sessão salva no localStorage (versão web) caso não exista arquivo
+    use_hook(move || {
         spawn(async move {
             let mut eval = document::eval(
                 r#"
@@ -82,32 +174,25 @@ fn App() -> Element {
                 }
                 "#,
             );
-            if let Ok(val) = eval.recv::<String>().await {
-                if !val.trim().is_empty() {
-                    if let Ok(sess) = serde_json::from_str::<crate::storage::StoredSession>(&val) {
-                        if current_user.read().is_none() {
-                            auth_token.set(Some(sess.token.clone()));
-                            current_user.set(Some(sess.user));
-                            let new_client = ApiClient::new(Some(client.base_url.clone()), Some(sess.token.clone()));
-                            api_client.set(new_client.clone());
+            let Ok(val) = eval.recv::<String>().await else { return };
+            if val.trim().is_empty() || current_user.peek().is_some() {
+                return;
+            }
+            let Ok(sess) = serde_json::from_str::<crate::storage::StoredSession>(&val) else { return };
 
-                            spawn(async move {
-                                if new_client.get_me().await.is_err() {
-                                    auth_token.set(None);
-                                    current_user.set(None);
-                                    crate::storage::clear_session();
-                                }
-                            });
-                        }
-                    }
-                }
+            let base_url = api_client.peek().base_url.clone();
+            let candidate = ApiClient::new(Some(base_url), Some(sess.token.clone()));
+            match candidate.get_me().await {
+                Ok(user) => login_with(sess.token, user),
+                Err(err) if err.is_unauthorized() => crate::storage::clear_session(),
+                // Sem internet: usa a sessão salva e valida depois
+                Err(_) => login_with(sess.token, sess.user),
             }
         });
     });
 
-    // Auto-login se houver callback do Google / Supabase na URL ou via Intent nativo
-    use_effect(move || {
-        let client = api_client.read().clone();
+    // Login com Google: o token chega pela URL (web) ou pelo deep link nativo (Android)
+    use_hook(move || {
         spawn(async move {
             let mut eval = document::eval(
                 r#"
@@ -115,66 +200,68 @@ fn App() -> Element {
                     let hash = window.location.hash || window.location.search || "";
                     if (hash.includes("access_token=")) {
                         dioxus.send(hash);
+                        window.history.replaceState({}, document.title, window.location.pathname);
                     }
                 }
                 window.addEventListener("hashchange", sendHashIfPresent);
                 window.onAppComprasToken = function(h) {
-                    dioxus.send(h);
+                    dioxus.send(String(h));
                 };
                 sendHashIfPresent();
                 "#,
             );
             while let Ok(val) = eval.recv::<String>().await {
-                if val.contains("access_token=") {
-                    let token_part = val.split("access_token=").nth(1).unwrap_or("");
-                    let access_token = token_part.split('&').next().unwrap_or("");
-                    if !access_token.is_empty() {
-                        match client.google_auth(access_token.to_string()).await {
-                            Ok(res) => {
-                                crate::storage::save_session(&res.token, &res.user);
-                                auth_token.set(Some(res.token.clone()));
-                                current_user.set(Some(res.user));
-                                api_client.set(ApiClient::new(Some(client.base_url.clone()), Some(res.token)));
-                                let _ = document::eval("window.history.replaceState({}, document.title, window.location.pathname);");
-                            }
-                            Err(e) => {
-                                error_msg.set(Some(format!("Falha na autenticação Google: {}", e)));
-                            }
-                        }
+                let Some(access_token) = extract_access_token(&val) else { continue };
+                // Deep links podem vir de qualquer site/app: nunca troca uma sessão ativa e
+                // só aceita o token se o login com Google foi iniciado aqui há pouco
+                if current_user.peek().is_some() || !crate::storage::take_oauth_pending().await {
+                    continue;
+                }
+                let client = ApiClient::new(Some(api_client.peek().base_url.clone()), None);
+                match client.google_auth(access_token).await {
+                    Ok(res) => {
+                        error_msg.set(None);
+                        login_with(res.token, res.user);
+                    }
+                    Err(e) => {
+                        error_msg.set(Some(format!("Falha na autenticação Google: {}", e)));
                     }
                 }
             }
         });
     });
 
+    let is_live = *live_status.0.read();
+
     rsx! {
         style { "{APP_CSS}" }
 
         div { class: "app-container",
             // Header / Navbar exibido quando autenticado
-            if current_user.read().is_some() {
+            if let Some(user) = current_user.read().as_ref() {
                 header { class: "navbar",
-                    h1 {
-                        div { class: "brand-badge", "🛒" }
+                    div { class: "navbar-brand",
+                        div { class: "brand-badge", Icon { kind: IconKind::Cart, size: 16 } }
                         span { "App Compras" }
-                        div { class: "live-indicator",
-                            span { class: "live-dot" }
-                            span { "Ao vivo" }
+                        if is_live {
+                            div { class: "live-indicator",
+                                span { class: "live-dot" }
+                                span { "Ao vivo" }
+                            }
                         }
                     }
 
-                    if let Some(user) = current_user.read().as_ref() {
-                        div { class: "nav-actions",
-                            div { class: "user-chip",
-                                div { class: "user-avatar-circle", "{user.name.chars().next().unwrap_or('U')}" }
-                                span { "{user.name}" }
+                    div { class: "nav-actions",
+                        div { class: "user-chip",
+                            div { class: "user-avatar-circle", "aria-hidden": "true",
+                                "{user.name.chars().next().unwrap_or('U').to_uppercase()}"
                             }
-                            button {
-                                class: "btn-logout",
-                                title: "Desconectar",
-                                onclick: handle_logout,
-                                "Sair"
-                            }
+                            span { "{user.name}" }
+                        }
+                        button {
+                            class: "btn-logout",
+                            onclick: handle_logout,
+                            "Sair"
                         }
                     }
                 }
@@ -190,7 +277,9 @@ fn App() -> Element {
                 }
             } else if let Some(list_id) = *active_list_id.read() {
                 ListDetailView {
+                    key: "{list_id}",
                     api_client,
+                    current_user,
                     list_id,
                     active_list_id,
                     error_msg,
@@ -206,5 +295,21 @@ fn App() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_only_valid_tokens() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc-def_123";
+        assert_eq!(
+            extract_access_token(&format!("#access_token={}&expires_in=3600", jwt)).as_deref(),
+            Some(jwt)
+        );
+        assert_eq!(extract_access_token("#access_token=';alert(1)//"), None);
+        assert_eq!(extract_access_token("#foo=bar"), None);
     }
 }
