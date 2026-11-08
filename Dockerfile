@@ -31,6 +31,14 @@ RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/
 
 # Copia o binário do estágio de build
 COPY --from=builder /app/target/release/backend /app/backend
+# Migrações SQL (aplicadas na inicialização quando RUN_MIGRATIONS=true)
+COPY migrations /app/migrations
+
+# Executa sem privilégios de root
+RUN useradd --system --no-create-home appuser
+USER appuser
+
+ENV APP_ENV=production
 
 # O Railway injeta a porta dinamicamente na variável PORT (com fallback padrão no código)
 EXPOSE 3000

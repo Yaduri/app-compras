@@ -9,35 +9,32 @@ use uuid::Uuid;
 
 use crate::auth::AuthenticatedUser;
 use crate::error::AppError;
+use crate::routes::item_routes::{item_from_row, ITEM_COLUMNS, ITEM_JOINS};
 use crate::state::AppState;
+use crate::validation;
 use shared::categories::CategoryId;
 use shared::dto::{
     CreateListRequest, FrequentItemResponse, JoinListRequest, ListDetailResponse, ListMemberInfo,
     ListSummaryResponse, ListTotals, UpdateListRequest,
 };
-use shared::models::{Item, List, MemberRole, QuantityUnit};
+use shared::models::{List, MemberRole, QuantityUnit};
 use shared::ws::WsServerMessage;
 
-/// Gera um código alfanumérico amigável e legível para convite (ex: CASA-8F2A)
+/// Gera um código alfanumérico amigável e legível para convite (ex: 8F2A-K9QX)
 pub fn generate_invite_code() -> String {
     const CHARSET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
     let mut rng = rand::thread_rng();
-    let part1: String = (0..4)
-        .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
-    let part2: String = (0..4)
-        .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
+    let mut part = || -> String {
+        (0..4)
+            .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+            .collect()
+    };
+    let part1 = part();
+    let part2 = part();
     format!("{}-{}", part1, part2)
 }
 
-/// Helper para verificar se o usuário autenticado pertence à lista
+/// Verifica se o usuário autenticado pertence à lista e devolve o papel dele
 pub async fn verify_membership(
     pool: &sqlx::PgPool,
     list_id: Uuid,
@@ -54,61 +51,92 @@ pub async fn verify_membership(
     Ok(MemberRole::from_str(&role_str))
 }
 
+async fn verify_owner(pool: &sqlx::PgPool, list_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
+    match verify_membership(pool, list_id, user_id).await? {
+        MemberRole::Owner => Ok(()),
+        MemberRole::Member => Err(AppError::Forbidden(
+            "Apenas o dono da lista pode fazer isso".to_string(),
+        )),
+    }
+}
+
+/// Atualiza `lists.updated_at` (ordenação do painel). Falha aqui não deve quebrar a operação.
+pub async fn touch_list(pool: &sqlx::PgPool, list_id: Uuid) {
+    if let Err(err) = sqlx::query("UPDATE lists SET updated_at = NOW() WHERE id = $1")
+        .bind(list_id)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!("Falha ao atualizar updated_at da lista {}: {}", list_id, err);
+    }
+}
+
+fn list_from_row(row: &sqlx::postgres::PgRow) -> Result<List, AppError> {
+    Ok(List {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        description: row.try_get("description")?,
+        invite_code: row.try_get("invite_code")?,
+        created_by: row.try_get("created_by")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+/// Totais calculados no SQL. Regra: soma o preço pago ou, na falta, o estimado de cada item.
+const LIST_TOTALS_SQL: &str = r#"
+    (SELECT COUNT(*) FROM list_members WHERE list_id = l.id) AS member_count,
+    (SELECT COUNT(*) FROM items WHERE list_id = l.id) AS item_count,
+    (SELECT COUNT(*) FROM items WHERE list_id = l.id AND purchased = true) AS purchased_count,
+    COALESCE((SELECT SUM(COALESCE(actual_price, estimated_price, 0)) FROM items WHERE list_id = l.id), 0)::float8 AS total_planned,
+    COALESCE((SELECT SUM(COALESCE(actual_price, estimated_price, 0)) FROM items WHERE list_id = l.id AND purchased = true), 0)::float8 AS total_cart
+"#;
+
+fn summary_from_row(row: &sqlx::postgres::PgRow) -> Result<ListSummaryResponse, AppError> {
+    let role_str: String = row.try_get("role")?;
+    let member_count: i64 = row.try_get("member_count")?;
+    let item_count: i64 = row.try_get("item_count")?;
+    let purchased_count: i64 = row.try_get("purchased_count")?;
+
+    Ok(ListSummaryResponse {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        description: row.try_get("description")?,
+        invite_code: row.try_get("invite_code")?,
+        role: MemberRole::from_str(&role_str),
+        member_count: member_count.max(0) as usize,
+        totals: ListTotals {
+            total_items: item_count.max(0) as usize,
+            purchased_items: purchased_count.max(0) as usize,
+            total_planned: row.try_get("total_planned")?,
+            total_cart: row.try_get("total_cart")?,
+        },
+    })
+}
+
 pub async fn list_user_lists(
     State(state): State<AppState>,
     user: AuthenticatedUser,
 ) -> Result<Json<Vec<ListSummaryResponse>>, AppError> {
     if let Some(pool) = &state.pool {
-        // Consulta todas as listas das quais o usuário participa com contadores e totais
-        let query = r#"
-            SELECT 
-                l.id,
-                l.name,
-                l.description,
-                l.invite_code,
-                lm.role,
-                (SELECT COUNT(*) FROM list_members WHERE list_id = l.id) as member_count,
-                (SELECT COUNT(*) FROM items WHERE list_id = l.id) as item_count,
-                (SELECT COUNT(*) FROM items WHERE list_id = l.id AND purchased = true) as purchased_count,
-                COALESCE((SELECT SUM(COALESCE(actual_price, estimated_price, 0)) FROM items WHERE list_id = l.id), 0)::float8 as total_planned,
-                COALESCE((SELECT SUM(COALESCE(actual_price, estimated_price, 0)) FROM items WHERE list_id = l.id AND purchased = true), 0)::float8 as total_cart
+        let sql = format!(
+            r#"
+            SELECT l.id, l.name, l.description, l.invite_code, lm.role, {LIST_TOTALS_SQL}
             FROM lists l
             INNER JOIN list_members lm ON l.id = lm.list_id
             WHERE lm.user_id = $1
             ORDER BY l.updated_at DESC
-        "#;
+            "#
+        );
 
-        let rows = sqlx::query(query).bind(user.id).fetch_all(pool).await?;
-
-        let mut summaries = Vec::with_capacity(rows.len());
-        for row in rows {
-            let role_str: String = row.try_get("role")?;
-            let member_count: i64 = row.try_get("member_count")?;
-            let item_count: i64 = row.try_get("item_count")?;
-            let purchased_count: i64 = row.try_get("purchased_count")?;
-            let total_planned: f64 = row.try_get("total_planned")?;
-            let total_cart: f64 = row.try_get("total_cart")?;
-
-            summaries.push(ListSummaryResponse {
-                id: row.try_get("id")?,
-                name: row.try_get("name")?,
-                description: row.try_get("description")?,
-                invite_code: row.try_get("invite_code")?,
-                role: MemberRole::from_str(&role_str),
-                member_count: member_count as usize,
-                totals: ListTotals {
-                    total_items: item_count as usize,
-                    purchased_items: purchased_count as usize,
-                    total_planned,
-                    total_cart,
-                },
-            });
-        }
-
+        let rows = sqlx::query(&sql).bind(user.id).fetch_all(pool).await?;
+        let summaries = rows
+            .iter()
+            .map(summary_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Json(summaries))
     } else {
-        let summaries = state.memory.list_user_lists(user.id).await;
-        Ok(Json(summaries))
+        Ok(Json(state.memory.list_user_lists(user.id).await))
     }
 }
 
@@ -117,70 +145,69 @@ pub async fn create_list(
     user: AuthenticatedUser,
     Json(payload): Json<CreateListRequest>,
 ) -> Result<Json<List>, AppError> {
-    let name = payload.name.trim().to_string();
-    if name.is_empty() {
-        return Err(AppError::BadRequest(
-            "O nome da lista não pode ser vazio".to_string(),
-        ));
-    }
+    let name = validation::required_text(&payload.name, "O nome da lista", validation::MAX_LIST_NAME)?;
+    let description = validation::optional_text(
+        payload.description.as_deref(),
+        "A descrição",
+        validation::MAX_LIST_DESCRIPTION,
+    )?;
 
     if let Some(pool) = &state.pool {
-        // Gera código de convite único
-        let mut invite_code = generate_invite_code();
-        for _ in 0..5 {
-            let existing = sqlx::query("SELECT id FROM lists WHERE invite_code = $1")
-                .bind(&invite_code)
-                .fetch_optional(pool)
+        // Tenta alguns códigos; a restrição UNIQUE do banco é a garantia final
+        for attempt in 0..5 {
+            let invite_code = generate_invite_code();
+            let mut tx = pool.begin().await?;
+
+            let inserted = sqlx::query(
+                r#"
+                INSERT INTO lists (name, description, invite_code, created_by)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id, name, description, invite_code, created_by, created_at, updated_at
+                "#,
+            )
+            .bind(&name)
+            .bind(&description)
+            .bind(&invite_code)
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await;
+
+            let row = match inserted {
+                Ok(row) => row,
+                Err(err) => {
+                    let duplicate = err
+                        .as_database_error()
+                        .and_then(|e| e.code())
+                        .map(|c| c == "23505")
+                        .unwrap_or(false);
+                    if duplicate && attempt < 4 {
+                        continue; // código repetido: tenta outro (a transação é desfeita ao sair)
+                    }
+                    return Err(err.into());
+                }
+            };
+
+            let list = list_from_row(&row)?;
+
+            // O criador entra automaticamente como dono ('owner')
+            sqlx::query("INSERT INTO list_members (list_id, user_id, role) VALUES ($1, $2, 'owner')")
+                .bind(list.id)
+                .bind(user.id)
+                .execute(&mut *tx)
                 .await?;
-            if existing.is_none() {
-                break;
-            }
+
+            tx.commit().await?;
+            return Ok(Json(list));
+        }
+        Err(AppError::Internal("Não foi possível gerar um código de convite único".to_string()))
+    } else {
+        let mut invite_code = generate_invite_code();
+        while state.memory.invite_code_exists(&invite_code).await {
             invite_code = generate_invite_code();
         }
-
-        let mut tx = pool.begin().await?;
-
-        let row = sqlx::query(
-            r#"
-            INSERT INTO lists (name, description, invite_code, created_by)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, name, description, invite_code, created_by, created_at, updated_at
-            "#,
-        )
-        .bind(&name)
-        .bind(&payload.description)
-        .bind(&invite_code)
-        .bind(user.id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        let list_id: Uuid = row.try_get("id")?;
-
-        // Adiciona o criador automaticamente como proprietário ('owner')
-        sqlx::query(
-            "INSERT INTO list_members (list_id, user_id, role) VALUES ($1, $2, 'owner')",
-        )
-        .bind(list_id)
-        .bind(user.id)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(Json(List {
-            id: list_id,
-            name: row.try_get("name")?,
-            description: row.try_get("description")?,
-            invite_code: row.try_get("invite_code")?,
-            created_by: row.try_get("created_by")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
-        }))
-    } else {
-        let invite_code = generate_invite_code();
         let list = state
             .memory
-            .create_list(user.id, name, payload.description, invite_code)
+            .create_list(user.id, name, description, invite_code)
             .await;
         Ok(Json(list))
     }
@@ -191,28 +218,22 @@ pub async fn get_list_detail(
     user: AuthenticatedUser,
     Path(list_id): Path<Uuid>,
 ) -> Result<Json<ListDetailResponse>, AppError> {
-    if let Some(pool) = &state.pool {
-        verify_membership(pool, list_id, user.id).await?;
+    let Some(pool) = &state.pool else {
+        let detail = state.memory.get_list_detail(list_id, user.id).await?;
+        return Ok(Json(detail));
+    };
 
-    // Consulta dados cadastrais da lista
+    verify_membership(pool, list_id, user.id).await?;
+
     let list_row = sqlx::query(
         "SELECT id, name, description, invite_code, created_by, created_at, updated_at FROM lists WHERE id = $1",
     )
     .bind(list_id)
-    .fetch_one(pool)
-    .await?;
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Lista não encontrada".to_string()))?;
+    let list = list_from_row(&list_row)?;
 
-    let list = List {
-        id: list_row.try_get("id")?,
-        name: list_row.try_get("name")?,
-        description: list_row.try_get("description")?,
-        invite_code: list_row.try_get("invite_code")?,
-        created_by: list_row.try_get("created_by")?,
-        created_at: list_row.try_get("created_at")?,
-        updated_at: list_row.try_get("updated_at")?,
-    };
-
-    // Consulta membros da lista
     let member_rows = sqlx::query(
         r#"
         SELECT lm.user_id, lm.role, lm.joined_at, u.name, u.email, u.avatar_url
@@ -239,88 +260,43 @@ pub async fn get_list_detail(
         });
     }
 
-    // Consulta itens da lista
-    let item_rows = sqlx::query(
+    let items_sql = format!(
         r#"
-        SELECT 
-            i.id, i.list_id, i.name, i.category_id, 
-            i.quantity::float8 as quantity, i.unit,
-            i.estimated_price::float8 as estimated_price,
-            i.actual_price::float8 as actual_price,
-            i.purchased, i.purchased_at,
-            i.purchased_by_user_id,
-            up.name as purchased_by_user_name,
-            i.added_by_user_id,
-            ua.name as added_by_user_name,
-            i.notes, i.created_at, i.updated_at
+        SELECT {ITEM_COLUMNS}
         FROM items i
-        INNER JOIN users ua ON i.added_by_user_id = ua.id
-        LEFT JOIN users up ON i.purchased_by_user_id = up.id
+        {ITEM_JOINS}
         WHERE i.list_id = $1
         ORDER BY i.purchased ASC, i.created_at DESC
-        "#,
-    )
-    .bind(list_id)
-    .fetch_all(pool)
-    .await?;
+        "#
+    );
+    let item_rows = sqlx::query(&items_sql).bind(list_id).fetch_all(pool).await?;
 
-    let mut items = Vec::with_capacity(item_rows.len());
-    let mut total_planned = 0.0;
-    let mut total_cart = 0.0;
-    let mut purchased_count = 0;
+    let items = item_rows
+        .iter()
+        .map(item_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
 
-    for r in item_rows {
-        let category_id_str: String = r.try_get("category_id")?;
-        let unit_str: String = r.try_get("unit")?;
-        let purchased: bool = r.try_get("purchased")?;
-        let estimated: Option<f64> = r.try_get("estimated_price")?;
-        let actual: Option<f64> = r.try_get("actual_price")?;
-
-        let price_value = actual.or(estimated).unwrap_or(0.0);
-        total_planned += price_value;
-        if purchased {
-            purchased_count += 1;
-            total_cart += price_value;
-        }
-
-        items.push(Item {
-            id: r.try_get("id")?,
-            list_id: r.try_get("list_id")?,
-            name: r.try_get("name")?,
-            category_id: CategoryId::from_id_str(&category_id_str),
-            quantity: r.try_get("quantity")?,
-            unit: QuantityUnit::from_unit_str(&unit_str),
-            estimated_price: estimated,
-            actual_price: actual,
-            purchased,
-            purchased_at: r.try_get("purchased_at")?,
-            purchased_by_user_id: r.try_get("purchased_by_user_id")?,
-            purchased_by_user_name: r.try_get("purchased_by_user_name")?,
-            added_by_user_id: r.try_get("added_by_user_id")?,
-            added_by_user_name: r.try_get("added_by_user_name")?,
-            notes: r.try_get("notes")?,
-            created_at: r.try_get("created_at")?,
-            updated_at: r.try_get("updated_at")?,
-        });
-    }
-
-    let totals = ListTotals {
+    let mut totals = ListTotals {
         total_items: items.len(),
-        purchased_items: purchased_count,
-        total_planned,
-        total_cart,
+        purchased_items: 0,
+        total_planned: 0.0,
+        total_cart: 0.0,
     };
-
-        Ok(Json(ListDetailResponse {
-            list,
-            members,
-            items,
-            totals,
-        }))
-    } else {
-        let detail = state.memory.get_list_detail(list_id, user.id).await?;
-        Ok(Json(detail))
+    for item in &items {
+        let price = item.actual_price.or(item.estimated_price).unwrap_or(0.0);
+        totals.total_planned += price;
+        if item.purchased {
+            totals.purchased_items += 1;
+            totals.total_cart += price;
+        }
     }
+
+    Ok(Json(ListDetailResponse {
+        list,
+        members,
+        items,
+        totals,
+    }))
 }
 
 pub async fn update_list(
@@ -329,36 +305,49 @@ pub async fn update_list(
     Path(list_id): Path<Uuid>,
     Json(payload): Json<UpdateListRequest>,
 ) -> Result<Json<List>, AppError> {
-    let pool = state.get_pool()?;
-    verify_membership(pool, list_id, user.id).await?;
-
-    let row = sqlx::query(
-        r#"
-        UPDATE lists
-        SET name = COALESCE($1, name),
-            description = COALESCE($2, description),
-            updated_at = NOW()
-        WHERE id = $3
-        RETURNING id, name, description, invite_code, created_by, created_at, updated_at
-        "#,
-    )
-    .bind(&payload.name)
-    .bind(&payload.description)
-    .bind(list_id)
-    .fetch_one(pool)
-    .await?;
-
-    let list = List {
-        id: row.try_get("id")?,
-        name: row.try_get("name")?,
-        description: row.try_get("description")?,
-        invite_code: row.try_get("invite_code")?,
-        created_by: row.try_get("created_by")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
+    let name = match payload.name.as_deref() {
+        Some(n) => Some(validation::required_text(n, "O nome da lista", validation::MAX_LIST_NAME)?),
+        None => None,
+    };
+    // None = manter; Some(None) = remover; Some(Some(texto)) = definir
+    let description = match payload.description.as_deref() {
+        Some(d) => Some(validation::optional_text(
+            Some(d),
+            "A descrição",
+            validation::MAX_LIST_DESCRIPTION,
+        )?),
+        None => None,
     };
 
-    // Emite atualização via WebSocket
+    let list = if let Some(pool) = &state.pool {
+        verify_owner(pool, list_id, user.id).await?;
+
+        let description_param: Option<String> = description.clone().map(|d| d.unwrap_or_default());
+        let row = sqlx::query(
+            r#"
+            UPDATE lists
+            SET name = COALESCE($1, name),
+                description = CASE WHEN $2::text IS NULL THEN description ELSE NULLIF($2::text, '') END,
+                updated_at = NOW()
+            WHERE id = $3
+            RETURNING id, name, description, invite_code, created_by, created_at, updated_at
+            "#,
+        )
+        .bind(&name)
+        .bind(description_param)
+        .bind(list_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Lista não encontrada".to_string()))?;
+
+        list_from_row(&row)?
+    } else {
+        state
+            .memory
+            .update_list(list_id, user.id, name, description)
+            .await?
+    };
+
     state
         .hub
         .send(
@@ -380,24 +369,21 @@ pub async fn delete_list(
     Path(list_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if let Some(pool) = &state.pool {
-        let role = verify_membership(pool, list_id, user.id).await?;
-
-        if role != MemberRole::Owner {
-            return Err(AppError::Forbidden(
-                "Apenas o criador/proprietário pode excluir esta lista".to_string(),
-            ));
-        }
+        verify_owner(pool, list_id, user.id).await?;
 
         sqlx::query("DELETE FROM lists WHERE id = $1")
             .bind(list_id)
             .execute(pool)
             .await?;
     } else {
-        let mut lists = state.memory.lists.write().await;
-        lists.remove(&list_id);
-        let mut items = state.memory.items.write().await;
-        items.retain(|_, item| item.list_id != list_id);
+        state.memory.delete_list(list_id, user.id).await?;
     }
+
+    // Avisa quem está com a lista aberta
+    state
+        .hub
+        .send(list_id, WsServerMessage::ListDeleted { list_id })
+        .await;
 
     Ok(Json(serde_json::json!({
         "status": "success",
@@ -410,37 +396,63 @@ pub async fn join_list(
     user: AuthenticatedUser,
     Json(payload): Json<JoinListRequest>,
 ) -> Result<Json<ListSummaryResponse>, AppError> {
-    if let Some(pool) = &state.pool {
-        let code = payload.invite_code.trim().to_uppercase();
+    // Limita tentativas por usuário para impedir adivinhação de códigos
+    state.limits.join.check(&format!("join:{}", user.id))?;
 
-        let list_row = sqlx::query(
-            "SELECT id, name, description, invite_code FROM lists WHERE UPPER(invite_code) = $1",
-        )
+    let code = payload.invite_code.trim().to_uppercase();
+    if code.is_empty() || code.len() > validation::MAX_INVITE_CODE {
+        return Err(AppError::BadRequest("Código de convite inválido".to_string()));
+    }
+
+    let Some(pool) = &state.pool else {
+        let (summary, newly_joined) = state.memory.join_by_code(user.id, &code).await?;
+        if newly_joined {
+            if let Some(member) = state.memory.member_info(summary.id, user.id).await {
+                state
+                    .hub
+                    .send(summary.id, WsServerMessage::MemberJoined { list_id: summary.id, member })
+                    .await;
+            }
+        }
+        return Ok(Json(summary));
+    };
+
+    let list_id: Uuid = sqlx::query("SELECT id FROM lists WHERE UPPER(invite_code) = $1")
         .bind(&code)
         .fetch_optional(pool)
         .await?
-        .ok_or_else(|| AppError::NotFound("Código de convite inválido ou lista não encontrada".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Código de convite inválido ou lista não encontrada".to_string()))?
+        .try_get("id")?;
 
-        let list_id: Uuid = list_row.try_get("id")?;
+    // Insere o membro (se ainda não for). `xmax = 0` indica que a linha acabou de ser criada.
+    let joined_row = sqlx::query(
+        r#"
+        INSERT INTO list_members (list_id, user_id, role)
+        VALUES ($1, $2, 'member')
+        ON CONFLICT (list_id, user_id) DO UPDATE SET role = list_members.role
+        RETURNING joined_at, role, (xmax = 0) AS inserted
+        "#,
+    )
+    .bind(list_id)
+    .bind(user.id)
+    .fetch_one(pool)
+    .await?;
 
-        // Insere o membro na lista (se ainda não for membro)
-        let joined_row = sqlx::query(
-            r#"
-            INSERT INTO list_members (list_id, user_id, role)
-            VALUES ($1, $2, 'member')
-            ON CONFLICT (list_id, user_id) DO UPDATE SET role = list_members.role
-            RETURNING joined_at, role
-            "#,
-        )
-        .bind(list_id)
-        .bind(user.id)
-        .fetch_one(pool)
-        .await?;
+    let joined_at: DateTime<Utc> = joined_row.try_get("joined_at")?;
+    let role = MemberRole::from_str(&joined_row.try_get::<String, _>("role")?);
+    let inserted: bool = joined_row.try_get("inserted")?;
 
-        let joined_at: DateTime<Utc> = joined_row.try_get("joined_at")?;
-        let role_str: String = joined_row.try_get("role")?;
+    if inserted {
+        touch_list(pool, list_id).await;
 
-        // Notifica outros membros via WebSocket
+        let avatar_url: Option<String> = sqlx::query("SELECT avatar_url FROM users WHERE id = $1")
+            .bind(user.id)
+            .fetch_optional(pool)
+            .await?
+            .map(|r| r.try_get::<Option<String>, _>("avatar_url"))
+            .transpose()?
+            .flatten();
+
         state
             .hub
             .send(
@@ -451,53 +463,30 @@ pub async fn join_list(
                         user_id: user.id,
                         name: user.name.clone(),
                         email: user.email.clone(),
-                        avatar_url: None,
-                        role: MemberRole::from_str(&role_str),
+                        avatar_url,
+                        role,
                         joined_at,
                     },
                 },
             )
             .await;
+    }
 
-        // Retorna o sumário da lista vinculada
-        let counts = sqlx::query(
-            r#"
-            SELECT 
-                (SELECT COUNT(*) FROM list_members WHERE list_id = $1) as member_count,
-                (SELECT COUNT(*) FROM items WHERE list_id = $1) as item_count,
-                (SELECT COUNT(*) FROM items WHERE list_id = $1 AND purchased = true) as purchased_count,
-                COALESCE((SELECT SUM(COALESCE(actual_price, estimated_price, 0)) FROM items WHERE list_id = $1), 0)::float8 as total_planned,
-                COALESCE((SELECT SUM(COALESCE(actual_price, estimated_price, 0)) FROM items WHERE list_id = $1 AND purchased = true), 0)::float8 as total_cart
-            "#,
-        )
+    let summary_sql = format!(
+        r#"
+        SELECT l.id, l.name, l.description, l.invite_code, lm.role, {LIST_TOTALS_SQL}
+        FROM lists l
+        INNER JOIN list_members lm ON l.id = lm.list_id AND lm.user_id = $2
+        WHERE l.id = $1
+        "#
+    );
+    let row = sqlx::query(&summary_sql)
         .bind(list_id)
+        .bind(user.id)
         .fetch_one(pool)
         .await?;
 
-        let member_count: i64 = counts.try_get("member_count")?;
-        let item_count: i64 = counts.try_get("item_count")?;
-        let purchased_count: i64 = counts.try_get("purchased_count")?;
-        let total_planned: f64 = counts.try_get("total_planned")?;
-        let total_cart: f64 = counts.try_get("total_cart")?;
-
-        Ok(Json(ListSummaryResponse {
-            id: list_id,
-            name: list_row.try_get("name")?,
-            description: list_row.try_get("description")?,
-            invite_code: list_row.try_get("invite_code")?,
-            role: MemberRole::Member,
-            member_count: member_count as usize,
-            totals: ListTotals {
-                total_items: item_count as usize,
-                purchased_items: purchased_count as usize,
-                total_planned,
-                total_cart,
-            },
-        }))
-    } else {
-        let summary = state.memory.join_by_code(user.id, &payload.invite_code).await?;
-        Ok(Json(summary))
-    }
+    Ok(Json(summary_from_row(&row)?))
 }
 
 pub async fn get_suggestions(
@@ -505,40 +494,39 @@ pub async fn get_suggestions(
     user: AuthenticatedUser,
     Path(list_id): Path<Uuid>,
 ) -> Result<Json<Vec<FrequentItemResponse>>, AppError> {
-    if let Some(pool) = &state.pool {
-        verify_membership(pool, list_id, user.id).await?;
+    let Some(pool) = &state.pool else {
+        return Ok(Json(state.memory.suggested_items(list_id, user.id).await?));
+    };
 
-        let rows = sqlx::query(
-            r#"
-            SELECT item_name_normalized, category_id, last_price::float8 as last_price, last_unit, purchase_count
-            FROM item_history
-            WHERE list_id = $1
-            ORDER BY purchase_count DESC, last_purchased_at DESC
-            LIMIT 20
-            "#,
-        )
-        .bind(list_id)
-        .fetch_all(pool)
-        .await?;
+    verify_membership(pool, list_id, user.id).await?;
 
-        let mut suggestions = Vec::with_capacity(rows.len());
-        for r in rows {
-            let cat_str: String = r.try_get("category_id")?;
-            let unit_str: String = r.try_get("last_unit")?;
-            suggestions.push(FrequentItemResponse {
-                name: r.try_get("item_name_normalized")?,
-                category_id: CategoryId::from_id_str(&cat_str),
-                last_price: r.try_get("last_price")?,
-                last_unit: QuantityUnit::from_unit_str(&unit_str),
-                purchase_count: r.try_get("purchase_count")?,
-            });
-        }
+    let rows = sqlx::query(
+        r#"
+        SELECT item_name_normalized, category_id, last_price::float8 AS last_price, last_unit, purchase_count
+        FROM item_history
+        WHERE list_id = $1
+        ORDER BY purchase_count DESC, last_purchased_at DESC
+        LIMIT 20
+        "#,
+    )
+    .bind(list_id)
+    .fetch_all(pool)
+    .await?;
 
-        Ok(Json(suggestions))
-    } else {
-        let suggestions = state.memory.suggested_items(list_id).await;
-        Ok(Json(suggestions))
+    let mut suggestions = Vec::with_capacity(rows.len());
+    for r in rows {
+        let cat_str: String = r.try_get("category_id")?;
+        let unit_str: String = r.try_get("last_unit")?;
+        suggestions.push(FrequentItemResponse {
+            name: r.try_get("item_name_normalized")?,
+            category_id: CategoryId::from_id_str(&cat_str),
+            last_price: r.try_get("last_price")?,
+            last_unit: QuantityUnit::from_unit_str(&unit_str),
+            purchase_count: r.try_get("purchase_count")?,
+        });
     }
+
+    Ok(Json(suggestions))
 }
 
 #[cfg(test)]
@@ -549,12 +537,13 @@ mod tests {
     fn test_invite_code_generation_format() {
         let code = generate_invite_code();
         assert_eq!(code.len(), 9); // 4 + '-' + 4
-        assert!(code.contains('-'));
         let parts: Vec<&str> = code.split('-').collect();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].len(), 4);
         assert_eq!(parts[1].len(), 4);
-        assert!(parts[0].chars().all(|c| c.is_ascii_alphanumeric() && !c.is_ascii_lowercase()));
-        assert!(parts[1].chars().all(|c| c.is_ascii_alphanumeric() && !c.is_ascii_lowercase()));
+        assert!(code
+            .chars()
+            .filter(|c| *c != '-')
+            .all(|c| c.is_ascii_alphanumeric() && !c.is_ascii_lowercase()));
     }
 }

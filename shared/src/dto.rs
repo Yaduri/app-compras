@@ -54,6 +54,7 @@ pub struct CreateListRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateListRequest {
     pub name: Option<String>,
+    /// `Some("")` remove a descrição
     pub description: Option<String>,
 }
 
@@ -123,7 +124,14 @@ pub struct UpdateItemRequest {
     pub unit: Option<QuantityUnit>,
     pub estimated_price: Option<f64>,
     pub actual_price: Option<f64>,
+    /// `Some("")` limpa as observações
     pub notes: Option<String>,
+    /// Quando `true`, remove o preço estimado (ignora `estimated_price`)
+    #[serde(default)]
+    pub clear_estimated_price: bool,
+    /// Quando `true`, remove o preço pago (ignora `actual_price`)
+    #[serde(default)]
+    pub clear_actual_price: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

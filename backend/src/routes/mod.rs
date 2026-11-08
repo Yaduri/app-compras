@@ -89,17 +89,23 @@ async fn root_handler() -> Html<&'static str> {
     </div>
   </div>
   <script>
-    const hash = window.location.hash || window.location.search || "";
-    if (hash.includes("access_token=")) {
-      const targetUri = "appcompras://auth" + hash;
+    // Repassa ao app apenas um access_token bem formado (sem caracteres que possam ser
+    // interpretados como código ou parâmetros extras)
+    const raw = (window.location.hash || window.location.search || "").replace(/^[#?]/, "");
+    const params = new URLSearchParams(raw);
+    const accessToken = params.get("access_token") || "";
+    if (/^[A-Za-z0-9._-]{20,8192}$/.test(accessToken)) {
+      const targetUri = "appcompras://auth#access_token=" + accessToken;
       document.getElementById("deep-link-btn").href = targetUri;
       document.getElementById("action").style.display = "block";
       document.getElementById("loading").style.display = "none";
+      // Remove o token da barra de endereços/histórico do navegador
+      history.replaceState(null, "", window.location.pathname);
       setTimeout(function() {
         window.location.href = targetUri;
       }, 300);
     } else {
-      document.getElementById("loading").innerHTML = "<h3 style='margin: 0 0 6px 0;'>App Compras API</h3><p style='color: #10b981; margin: 0;'>Servidor online em produção</p>";
+      document.getElementById("loading").innerHTML = "<h3 style='margin: 0 0 6px 0;'>App Compras API</h3><p style='color: #10b981; margin: 0;'>Servidor online</p>";
     }
   </script>
 </body>
@@ -107,7 +113,8 @@ async fn root_handler() -> Html<&'static str> {
 }
 
 pub fn create_router(state: AppState) -> Router {
-    // Configuração de CORS permissiva para desenvolvimento e mobile
+    // CORS aberto é seguro aqui: a API usa token Bearer no cabeçalho (sem cookies),
+    // então outros sites não conseguem agir em nome do usuário.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)

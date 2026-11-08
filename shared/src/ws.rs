@@ -16,6 +16,10 @@ pub enum WsClientMessage {
 
     /// Heartbeat para manter a conexão WebSocket ativa
     Ping,
+
+    /// Autentica a conexão com o JWT do usuário. Deve ser a primeira mensagem
+    /// enviada (evita expor o token na URL, que costuma aparecer em logs).
+    Auth { token: String },
 }
 
 /// Mensagens enviadas do Servidor para os Clientes conectados via WebSocket
@@ -71,6 +75,13 @@ pub enum WsServerMessage {
         list_id: Uuid,
         member: ListMemberInfo,
     },
+
+    /// Notificação de que a lista foi excluída pelo dono
+    ListDeleted { list_id: Uuid },
+
+    /// O servidor descartou eventos desta conexão (cliente lento); o cliente
+    /// deve recarregar a lista completa para não ficar dessincronizado.
+    ResyncRequired { list_id: Uuid },
 
     /// Resposta de heartbeat
     Pong,

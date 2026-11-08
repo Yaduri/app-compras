@@ -3,4 +3,4 @@ target/
 .env
 *.bat
 frontend/
-migrations/
+dist/

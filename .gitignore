@@ -5,3 +5,8 @@ Thumbs.db
 .DS_Store
 
 dist/
+
+# Assinatura do APK (nunca versionar)
+signing.bat
+*.jks
+*.keystore

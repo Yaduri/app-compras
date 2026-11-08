@@ -1,147 +1,131 @@
-use axum::{extract::State, Json};
+use axum::{extract::State, http::HeaderMap, Json};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::auth::{create_jwt, hash_password, verify_password, AuthenticatedUser};
 use crate::error::AppError;
+use crate::memory_db::DEMO_EMAIL;
+use crate::rate_limit::client_ip;
 use crate::state::AppState;
+use crate::validation;
 use shared::dto::{AuthResponse, GoogleAuthRequest, LoginRequest, RegisterRequest, UserProfile};
+
+/// Tamanho máximo aceito para um token externo (Supabase/Google)
+const MAX_EXTERNAL_TOKEN_LEN: usize = 8192;
+
+fn auth_response(state: &AppState, profile: UserProfile) -> Result<Json<AuthResponse>, AppError> {
+    let token = create_jwt(profile.id, &profile.email, &profile.name, &state.config.jwt_secret)?;
+    Ok(Json(AuthResponse { token, user: profile }))
+}
+
+fn profile_from_row(row: &sqlx::postgres::PgRow) -> Result<UserProfile, AppError> {
+    Ok(UserProfile {
+        id: row.try_get("id")?,
+        email: row.try_get("email")?,
+        name: row.try_get("name")?,
+        avatar_url: row.try_get("avatar_url")?,
+    })
+}
+
+fn invalid_credentials() -> AppError {
+    AppError::Unauthorized("E-mail ou senha incorretos".to_string())
+}
+
+fn social_account() -> AppError {
+    AppError::Unauthorized(
+        "Esta conta foi criada com o Google. Use o botão \"Entrar com Google\".".to_string(),
+    )
+}
 
 pub async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    let email = payload.email.trim().to_lowercase();
-    let name = payload.name.trim().to_string();
+    state.limits.auth_ip.check(&format!("ip:{}", client_ip(&headers)))?;
 
-    if email.is_empty() || payload.password.is_empty() || name.is_empty() {
-        return Err(AppError::BadRequest(
-            "Nome, email e senha são obrigatórios".to_string(),
-        ));
-    }
+    let name = validation::required_text(&payload.name, "O nome", validation::MAX_USER_NAME)?;
+    let email = validation::email(&payload.email)?;
+    validation::password(&payload.password)?;
 
-    if payload.password.len() < 6 {
-        return Err(AppError::BadRequest(
-            "A senha deve conter pelo menos 6 caracteres".to_string(),
-        ));
-    }
+    let password_hash = hash_password(payload.password).await?;
 
-    let (user_id, user_name, user_email, avatar_url) = if let Some(pool) = &state.pool {
-        // Verifica se já existe usuário com o e-mail informado
-        let exists = sqlx::query("SELECT id FROM users WHERE email = $1")
-            .bind(&email)
-            .fetch_optional(pool)
-            .await?;
-
-        if exists.is_some() {
-            return Err(AppError::Conflict(
-                "Já existe uma conta cadastrada com este e-mail".to_string(),
-            ));
-        }
-
-        let password_hash = hash_password(&payload.password)?;
-
+    let profile = if let Some(pool) = &state.pool {
+        // A restrição UNIQUE(email) evita duplicidade mesmo com cadastros simultâneos
         let row = sqlx::query(
-            "INSERT INTO users (email, name, password_hash) VALUES ($1, $2, $3) RETURNING id, email, name, avatar_url",
+            r#"
+            INSERT INTO users (email, name, password_hash) VALUES ($1, $2, $3)
+            ON CONFLICT (email) DO NOTHING
+            RETURNING id, email, name, avatar_url
+            "#,
         )
         .bind(&email)
         .bind(&name)
         .bind(&password_hash)
-        .fetch_one(pool)
-        .await?;
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| AppError::Conflict("Já existe uma conta cadastrada com este e-mail".to_string()))?;
 
-        (
-            row.try_get("id")?,
-            row.try_get("name")?,
-            row.try_get("email")?,
-            row.try_get("avatar_url")?,
-        )
+        profile_from_row(&row)?
     } else {
-        let password_hash = hash_password(&payload.password)?;
-        let u = state
-            .memory
-            .create_user(name, email, password_hash)
-            .await?;
-        (u.id, u.name, u.email, u.avatar_url)
+        let u = state.memory.create_user(name, email, password_hash, None).await?;
+        UserProfile { id: u.id, email: u.email, name: u.name, avatar_url: u.avatar_url }
     };
 
-    let token = create_jwt(user_id, &user_email, &user_name, &state.config.jwt_secret)?;
-
-    Ok(Json(AuthResponse {
-        token,
-        user: UserProfile {
-            id: user_id,
-            email: user_email,
-            name: user_name,
-            avatar_url,
-        },
-    }))
+    auth_response(&state, profile)
 }
 
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
     let email = payload.email.trim().to_lowercase();
+    if email.is_empty() || payload.password.is_empty() || email.len() > validation::MAX_EMAIL {
+        return Err(invalid_credentials());
+    }
 
-    let (user_id, user_name, user_email, avatar_url) = if let Some(pool) = &state.pool {
+    state.limits.auth_ip.check(&format!("ip:{}", client_ip(&headers)))?;
+    state.limits.login_email.check(&format!("login:{}", email))?;
+
+    let (profile, stored_hash) = if let Some(pool) = &state.pool {
         let row = sqlx::query(
             "SELECT id, email, name, avatar_url, password_hash FROM users WHERE email = $1",
         )
         .bind(&email)
         .fetch_optional(pool)
         .await?
-        .ok_or_else(|| AppError::Unauthorized("E-mail ou senha incorretos".to_string()))?;
+        .ok_or_else(invalid_credentials)?;
 
-        let stored_hash: Option<String> = row.try_get("password_hash")?;
-        let hash = stored_hash.ok_or_else(|| {
-            AppError::Unauthorized(
-                "Esta conta foi criada via login social. Por favor, entre com Google".to_string(),
-            )
-        })?;
-
-        if !verify_password(&payload.password, &hash)? {
-            return Err(AppError::Unauthorized("E-mail ou senha incorretos".to_string()));
-        }
-
-        (
-            row.try_get("id")?,
-            row.try_get("name")?,
-            row.try_get("email")?,
-            row.try_get("avatar_url")?,
-        )
+        let hash: Option<String> = row.try_get("password_hash")?;
+        (profile_from_row(&row)?, hash)
     } else {
         let (u, hash) = state
             .memory
             .find_user_by_email(&email)
             .await
-            .ok_or_else(|| AppError::Unauthorized("E-mail ou senha incorretos".to_string()))?;
-
-        if !verify_password(&payload.password, &hash)? {
-            return Err(AppError::Unauthorized("E-mail ou senha incorretos".to_string()));
-        }
-
-        (u.id, u.name, u.email, u.avatar_url)
+            .ok_or_else(invalid_credentials)?;
+        (
+            UserProfile { id: u.id, email: u.email, name: u.name, avatar_url: u.avatar_url },
+            Some(hash),
+        )
     };
 
-    let token = create_jwt(user_id, &user_email, &user_name, &state.config.jwt_secret)?;
+    // Conta criada via Google não tem senha (NULL no banco, "" no modo memória)
+    let hash = stored_hash.filter(|h| !h.is_empty()).ok_or_else(social_account)?;
 
-    Ok(Json(AuthResponse {
-        token,
-        user: UserProfile {
-            id: user_id,
-            email: user_email,
-            name: user_name,
-            avatar_url,
-        },
-    }))
+    if !verify_password(payload.password, hash).await? {
+        return Err(invalid_credentials());
+    }
+
+    auth_response(&state, profile)
 }
 
-#[derive(serde::Deserialize)]
-struct GoogleTokenClaims {
-    email: Option<String>,
+/// Identidade confirmada por um provedor externo
+struct ExternalIdentity {
+    email: String,
     name: Option<String>,
-    picture: Option<String>,
+    avatar_url: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -154,226 +138,225 @@ struct SupabaseUserMetadata {
 
 #[derive(serde::Deserialize, Debug)]
 struct SupabaseUserResponse {
-    id: Option<String>,
     email: Option<String>,
+    email_confirmed_at: Option<String>,
     user_metadata: Option<SupabaseUserMetadata>,
+}
+
+/// 1) Access token emitido pelo Supabase Auth do NOSSO projeto (fluxo OAuth do app)
+async fn identity_from_supabase(state: &AppState, token: &str) -> Option<ExternalIdentity> {
+    let (url, anon_key) = match (&state.config.supabase_url, &state.config.supabase_anon_key) {
+        (Some(u), Some(k)) => (u, k),
+        _ => return None,
+    };
+
+    let res = state
+        .http
+        .get(format!("{}/auth/v1/user", url))
+        .bearer_auth(token)
+        .header("apikey", anon_key)
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+
+    let user: SupabaseUserResponse = res.json().await.ok()?;
+    // Só aceita e-mails confirmados pelo provedor
+    user.email_confirmed_at.as_ref()?;
+    let email = user.email?;
+    let meta = user.user_metadata;
+    Some(ExternalIdentity {
+        email,
+        name: meta.as_ref().and_then(|m| m.full_name.clone().or_else(|| m.name.clone())),
+        avatar_url: meta.as_ref().and_then(|m| m.avatar_url.clone().or_else(|| m.picture.clone())),
+    })
+}
+
+/// 2) id_token do Google emitido para o NOSSO client ID (confere `aud` e e-mail verificado)
+async fn identity_from_google_id_token(state: &AppState, token: &str) -> Option<ExternalIdentity> {
+    if state.config.google_client_ids.is_empty() {
+        return None;
+    }
+
+    let res = state
+        .http
+        .get("https://oauth2.googleapis.com/tokeninfo")
+        .query(&[("id_token", token)])
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+
+    let claims: serde_json::Value = res.json().await.ok()?;
+    let str_claim = |key: &str| claims.get(key).and_then(|v| v.as_str()).map(str::to_string);
+
+    let aud = str_claim("aud")?;
+    if !state.config.google_client_ids.iter().any(|id| *id == aud) {
+        tracing::warn!("id_token do Google com audience não autorizado: {}", aud);
+        return None;
+    }
+
+    let issuer_ok = matches!(
+        str_claim("iss").as_deref(),
+        Some("accounts.google.com") | Some("https://accounts.google.com")
+    );
+    // O tokeninfo devolve email_verified como string "true" (ou booleano em alguns casos)
+    let verified = match claims.get("email_verified") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => s == "true",
+        _ => false,
+    };
+    if !issuer_ok || !verified {
+        return None;
+    }
+
+    Some(ExternalIdentity {
+        email: str_claim("email")?,
+        name: str_claim("name"),
+        avatar_url: str_claim("picture"),
+    })
 }
 
 pub async fn google_auth(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<GoogleAuthRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
+    state.limits.auth_ip.check(&format!("ip:{}", client_ip(&headers)))?;
+
     let token = payload.id_token.trim();
-    if token.is_empty() {
-        return Err(AppError::BadRequest("id_token inválido".to_string()));
+    if token.is_empty() || token.len() > MAX_EXTERNAL_TOKEN_LEN {
+        return Err(AppError::BadRequest("Token de login inválido".to_string()));
     }
 
-    let client = reqwest::Client::new();
-    let mut resolved_email = None;
-    let mut resolved_name = None;
-    let mut resolved_avatar = None;
-
-    // 1. Tenta validar via Supabase Auth (o fluxo OAuth web/mobile usa o Supabase)
-    let supabase_url = state
-        .config
-        .supabase_url
-        .as_deref()
-        .unwrap_or("https://xfzcsdtsjundbhhxqwjm.supabase.co");
-    let supabase_anon_key = state
-        .config
-        .supabase_anon_key
-        .as_deref()
-        .unwrap_or("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhmemNzZHRzanVuZGJoaHhxd2ptIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM5ODcyNDAsImV4cCI6MjEwOTU2MzI0MH0.CsD_qp8y8U1eMFoa2dnsgvnoWMpUPksyXOwdPJJRAfE");
-
-    if let Ok(res) = client
-        .get(format!("{}/auth/v1/user", supabase_url))
-        .bearer_auth(token)
-        .header("apikey", supabase_anon_key)
-        .send()
-        .await
-    {
-        if res.status().is_success() {
-            if let Ok(supa_user) = res.json::<SupabaseUserResponse>().await {
-                resolved_email = supa_user.email;
-                if let Some(meta) = supa_user.user_metadata {
-                    resolved_name = meta.full_name.or(meta.name);
-                    resolved_avatar = meta.avatar_url.or(meta.picture);
-                }
-            }
-        }
-    }
-
-    // 2. Se não resolveu via Supabase, tenta validar como id_token oficial do Google
-    if resolved_email.is_none() {
-        if let Ok(res) = client
-            .get(&format!(
-                "https://oauth2.googleapis.com/tokeninfo?id_token={}",
-                token
-            ))
-            .send()
+    let identity = match identity_from_supabase(&state, token).await {
+        Some(id) => id,
+        None => identity_from_google_id_token(&state, token)
             .await
-        {
-            if res.status().is_success() {
-                if let Ok(claims) = res.json::<GoogleTokenClaims>().await {
-                    resolved_email = claims.email;
-                    resolved_name = claims.name;
-                    resolved_avatar = claims.picture;
-                }
-            }
-        }
-    }
+            .ok_or_else(|| AppError::Unauthorized("Não foi possível validar o login com Google".to_string()))?,
+    };
 
-    // 3. Se falhar, tenta como access_token via userinfo endpoint do Google
-    if resolved_email.is_none() {
-        if let Ok(res) = client
-            .get("https://www.googleapis.com/oauth2/v3/userinfo")
-            .bearer_auth(token)
-            .send()
-            .await
-        {
-            if res.status().is_success() {
-                if let Ok(claims) = res.json::<GoogleTokenClaims>().await {
-                    resolved_email = claims.email;
-                    resolved_name = claims.name;
-                    resolved_avatar = claims.picture;
-                }
-            }
-        }
-    }
+    let email = validation::email(&identity.email)?;
+    let name = identity
+        .name
+        .as_deref()
+        .map(validation::truncate_name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| validation::truncate_name(email.split('@').next().unwrap_or("Usuário")));
 
-    let email = resolved_email.ok_or_else(|| {
-        AppError::Unauthorized("Não foi possível autenticar o token do Google".to_string())
-    })?;
-    let name = resolved_name
-        .unwrap_or_else(|| email.split('@').next().unwrap_or("Usuário Google").to_string());
-
-    let (user_id, user_name, user_email, avatar_url) = if let Some(pool) = &state.pool {
+    let profile = if let Some(pool) = &state.pool {
+        // Conta existente com o mesmo e-mail (verificado) é reaproveitada.
+        // O nome escolhido pelo usuário é mantido; só o avatar é atualizado.
+        // A senha é apagada: o cadastro por e-mail não confirma o endereço, então ela pode
+        // ter sido definida por outra pessoa antes do dono real entrar com o Google.
+        // Se havia senha, as sessões abertas com ela também são revogadas.
         let row = sqlx::query(
-            "INSERT INTO users (email, name, avatar_url) VALUES ($1, $2, $3)
-             ON CONFLICT (email) DO UPDATE SET 
-                name = COALESCE(EXCLUDED.name, users.name),
-                avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url)
-             RETURNING id, email, name, avatar_url",
+            r#"
+            INSERT INTO users (email, name, avatar_url) VALUES ($1, $2, $3)
+            ON CONFLICT (email) DO UPDATE SET
+                avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+                tokens_valid_after = CASE
+                    WHEN users.password_hash IS NOT NULL THEN NOW()
+                    ELSE users.tokens_valid_after
+                END,
+                password_hash = NULL
+            RETURNING id, email, name, avatar_url
+            "#,
         )
         .bind(&email)
         .bind(&name)
-        .bind(&resolved_avatar)
+        .bind(&identity.avatar_url)
         .fetch_one(pool)
         .await?;
 
-        (
-            row.try_get("id")?,
-            row.try_get("name")?,
-            row.try_get("email")?,
-            row.try_get("avatar_url")?,
-        )
+        profile_from_row(&row)?
     } else {
-        let existing = state.memory.find_user_by_email(&email).await;
-        if let Some((u, _)) = existing {
-            (u.id, u.name, u.email, u.avatar_url)
-        } else {
-            let u = state
-                .memory
-                .create_user(name.clone(), email.clone(), "".to_string())
-                .await?;
-            (u.id, u.name, u.email, u.avatar_url)
+        match state.memory.find_user_by_email(&email).await {
+            Some((u, _)) => {
+                state.memory.clear_password(u.id).await;
+                UserProfile { id: u.id, email: u.email, name: u.name, avatar_url: u.avatar_url }
+            }
+            None => {
+                let u = state
+                    .memory
+                    .create_user(name, email, String::new(), identity.avatar_url)
+                    .await?;
+                UserProfile { id: u.id, email: u.email, name: u.name, avatar_url: u.avatar_url }
+            }
         }
     };
 
-    let token = create_jwt(user_id, &user_email, &user_name, &state.config.jwt_secret)?;
-
-    Ok(Json(AuthResponse {
-        token,
-        user: UserProfile {
-            id: user_id,
-            email: user_email,
-            name: user_name,
-            avatar_url,
-        },
-    }))
+    auth_response(&state, profile)
 }
 
 pub async fn get_me(
     State(state): State<AppState>,
     user: AuthenticatedUser,
 ) -> Result<Json<UserProfile>, AppError> {
+    // Usuário removido mas com token ainda válido: trata como sessão inválida
+    let gone = || AppError::Unauthorized("Sessão inválida. Entre novamente.".to_string());
+
     if let Some(pool) = &state.pool {
         let row = sqlx::query("SELECT id, email, name, avatar_url FROM users WHERE id = $1")
             .bind(user.id)
             .fetch_optional(pool)
             .await?
-            .ok_or_else(|| AppError::NotFound("Usuário não encontrado".to_string()))?;
-
-        Ok(Json(UserProfile {
-            id: row.try_get("id")?,
-            email: row.try_get("email")?,
-            name: row.try_get("name")?,
-            avatar_url: row.try_get("avatar_url")?,
-        }))
+            .ok_or_else(gone)?;
+        Ok(Json(profile_from_row(&row)?))
     } else {
-        let u = state
-            .memory
-            .find_user_by_id(user.id)
-            .await
-            .ok_or_else(|| AppError::NotFound("Usuário não encontrado".to_string()))?;
-
-        Ok(Json(UserProfile {
-            id: u.id,
-            email: u.email,
-            name: u.name,
-            avatar_url: u.avatar_url,
-        }))
+        let u = state.memory.find_user_by_id(user.id).await.ok_or_else(gone)?;
+        Ok(Json(UserProfile { id: u.id, email: u.email, name: u.name, avatar_url: u.avatar_url }))
     }
 }
 
+/// Conta de demonstração compartilhada. Desativada em produção por padrão
+/// (ALLOW_DEMO=true reativa), pois todos que a usam veem as mesmas listas.
 pub async fn demo(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<AuthResponse>, AppError> {
-    let demo_email = "demo@mercado.com";
-    let (user_id, user_name, user_email, avatar_url) = if let Some(pool) = &state.pool {
-        let row = sqlx::query("SELECT id, email, name, avatar_url FROM users WHERE email = $1")
-            .bind(demo_email)
+    if !state.config.allow_demo {
+        return Err(AppError::NotFound("Modo demonstração desativado".to_string()));
+    }
+    state.limits.auth_ip.check(&format!("ip:{}", client_ip(&headers)))?;
+
+    let profile = if let Some(pool) = &state.pool {
+        let existing = sqlx::query("SELECT id, email, name, avatar_url FROM users WHERE email = $1")
+            .bind(DEMO_EMAIL)
             .fetch_optional(pool)
             .await?;
-        if let Some(r) = row {
-            (
-                r.try_get("id")?,
-                r.try_get("name")?,
-                r.try_get("email")?,
-                r.try_get("avatar_url")?,
-            )
-        } else {
-            let pass_hash = hash_password("demo123456")?;
-            let r = sqlx::query("INSERT INTO users (email, name, password_hash) VALUES ($1, 'Usuário Demo', $2) RETURNING id, email, name, avatar_url")
-                .bind(demo_email)
+        match existing {
+            Some(r) => profile_from_row(&r)?,
+            None => {
+                // Senha aleatória: a conta demo só é acessível por esta rota
+                let random_password = Uuid::new_v4().to_string();
+                let pass_hash = hash_password(random_password).await?;
+                let r = sqlx::query(
+                    r#"
+                    INSERT INTO users (email, name, password_hash) VALUES ($1, 'Usuário Demo', $2)
+                    ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+                    RETURNING id, email, name, avatar_url
+                    "#,
+                )
+                .bind(DEMO_EMAIL)
                 .bind(pass_hash)
                 .fetch_one(pool)
                 .await?;
-            (
-                r.try_get("id")?,
-                r.try_get("name")?,
-                r.try_get("email")?,
-                r.try_get("avatar_url")?,
-            )
+                profile_from_row(&r)?
+            }
         }
     } else {
         let (u, _) = state
             .memory
-            .find_user_by_email(demo_email)
+            .find_user_by_email(DEMO_EMAIL)
             .await
             .ok_or_else(|| AppError::NotFound("Usuário demo não encontrado".to_string()))?;
-        (u.id, u.name, u.email, u.avatar_url)
+        UserProfile { id: u.id, email: u.email, name: u.name, avatar_url: u.avatar_url }
     };
 
-    let token = create_jwt(user_id, &user_email, &user_name, &state.config.jwt_secret)?;
-
-    Ok(Json(AuthResponse {
-        token,
-        user: UserProfile {
-            id: user_id,
-            email: user_email,
-            name: user_name,
-            avatar_url,
-        },
-    }))
+    auth_response(&state, profile)
 }
